@@ -17,13 +17,16 @@
 #include <drm/drm_atomic.h>
 #include <drm/drm_crtc.h>
 #include <drm/drm_crtc_helper.h>
+#include <drm/drm_flip_work.h>
 #include <drm/drm_plane_helper.h>
 
+#include <linux/devfreq.h>
 #include <linux/iopoll.h>
 #include <linux/kernel.h>
 #include <linux/module.h>
 #include <linux/platform_device.h>
 #include <linux/clk.h>
+#include <linux/iopoll.h>
 #include <linux/of.h>
 #include <linux/of_device.h>
 #include <linux/pm_runtime.h>
@@ -38,6 +41,9 @@
 #include "rockchip_drm_gem.h"
 #include "rockchip_drm_fb.h"
 #include "rockchip_drm_vop.h"
+#include "rockchip_drm_backlight.h"
+
+#define MAX_VOPS	2
 
 #define VOP_REG_SUPPORT(vop, reg) \
 		(!reg.major || (reg.major == VOP_MAJOR(vop->data->version) && \
@@ -128,10 +134,15 @@ struct vop_zpos {
 	int zpos;
 };
 
+enum vop_pending {
+	VOP_PENDING_FB_UNREF,
+};
+
 struct vop_plane_state {
 	struct drm_plane_state base;
 	int format;
 	int zpos;
+	unsigned int logo_ymirror;
 	struct drm_rect src;
 	struct drm_rect dest;
 	dma_addr_t yrgb_mst;
@@ -176,8 +187,12 @@ struct vop {
 	bool vsync_work_pending;
 	bool loader_protect;
 	struct completion dsp_hold_completion;
-	struct completion wait_update_complete;
+
+	/* protected by dev->event_lock */
 	struct drm_pending_vblank_event *event;
+
+	struct drm_flip_work fb_unref_work;
+	unsigned long pending;
 
 	struct completion line_flag_completion;
 
@@ -190,10 +205,19 @@ struct vop {
 	/* physical map length of vop register */
 	uint32_t len;
 
+	void __iomem *lut_regs;
+	u32 *lut;
+	u32 lut_len;
+	bool lut_active;
+	void __iomem *cabc_lut_regs;
+	u32 cabc_lut_len;
+
 	/* one time only one process allowed to config the register */
 	spinlock_t reg_lock;
 	/* lock vop irq reg */
 	spinlock_t irq_lock;
+	/* mutex vop enable and disable */
+	struct mutex vop_lock;
 
 	unsigned int irq;
 
@@ -203,12 +227,22 @@ struct vop {
 	struct clk *dclk;
 	/* vop share memory frequency */
 	struct clk *aclk;
+	/* vop source handling, optional */
+	struct clk *dclk_source;
 
 	/* vop dclk reset */
 	struct reset_control *dclk_rst;
 
+	struct notifier_block dmc_nb;
+
+	struct rockchip_dclk_pll *pll;
+
 	struct vop_win win[];
 };
+
+static struct vop *dmc_vop[MAX_VOPS];
+static struct devfreq *devfreq_vop;
+static DEFINE_MUTEX(register_devfreq_lock);
 
 static inline void vop_writel(struct vop *vop, uint32_t offset, uint32_t v)
 {
@@ -302,11 +336,6 @@ static bool vop_is_allwin_disabled(struct vop *vop)
 	return true;
 }
 
-static bool vop_is_cfg_done_complete(struct vop *vop)
-{
-	return VOP_CTRL_GET(vop, cfg_done) ? false : true;
-}
-
 static bool vop_fs_irq_is_active(struct vop *vop)
 {
 	return VOP_INTR_GET_TYPE(vop, status, FS_INTR);
@@ -315,6 +344,21 @@ static bool vop_fs_irq_is_active(struct vop *vop)
 static bool vop_line_flag_is_active(struct vop *vop)
 {
 	return VOP_INTR_GET_TYPE(vop, status, LINE_FLAG_INTR);
+}
+
+static inline void vop_write_lut(struct vop *vop, uint32_t offset, uint32_t v)
+{
+	writel(v, vop->lut_regs + offset);
+}
+
+static inline uint32_t vop_read_lut(struct vop *vop, uint32_t offset)
+{
+	return readl(vop->lut_regs + offset);
+}
+
+static inline void vop_write_cabc_lut(struct vop *vop, uint32_t offset, uint32_t v)
+{
+	writel(v, vop->cabc_lut_regs + offset);
 }
 
 static bool has_rb_swapped(uint32_t format)
@@ -364,6 +408,8 @@ static bool is_yuv_output(uint32_t bus_format)
 	switch (bus_format) {
 	case MEDIA_BUS_FMT_YUV8_1X24:
 	case MEDIA_BUS_FMT_YUV10_1X30:
+	case MEDIA_BUS_FMT_UYYVYY8_0_5X24:
+	case MEDIA_BUS_FMT_UYYVYY10_0_5X30:
 		return true;
 	default:
 		return false;
@@ -767,6 +813,88 @@ static void vop_line_flag_irq_disable(struct vop *vop)
 	spin_unlock_irqrestore(&vop->irq_lock, flags);
 }
 
+static void vop_crtc_load_lut(struct drm_crtc *crtc)
+{
+	struct vop *vop = to_vop(crtc);
+	int i, dle, lut_idx;
+
+	if (!vop->is_enabled || !vop->lut || !vop->lut_regs)
+		return;
+
+	if (WARN_ON(!drm_modeset_is_locked(&crtc->mutex)))
+		return;
+
+	if (!VOP_CTRL_SUPPORT(vop, update_gamma_lut)) {
+		spin_lock(&vop->reg_lock);
+		VOP_CTRL_SET(vop, dsp_lut_en, 0);
+		vop_cfg_done(vop);
+		spin_unlock(&vop->reg_lock);
+
+#define CTRL_GET(name) VOP_CTRL_GET(vop, name)
+		readx_poll_timeout(CTRL_GET, dsp_lut_en,
+				dle, !dle, 5, 33333);
+	} else {
+		lut_idx = CTRL_GET(lut_buffer_index);
+	}
+
+	for (i = 0; i < vop->lut_len; i++)
+		vop_write_lut(vop, i << 2, vop->lut[i]);
+
+	spin_lock(&vop->reg_lock);
+
+	VOP_CTRL_SET(vop, dsp_lut_en, 1);
+	VOP_CTRL_SET(vop, update_gamma_lut, 1);
+	vop_cfg_done(vop);
+	vop->lut_active = true;
+
+	spin_unlock(&vop->reg_lock);
+
+	if (VOP_CTRL_SUPPORT(vop, update_gamma_lut)) {
+		readx_poll_timeout(CTRL_GET, lut_buffer_index,
+				   dle, dle != lut_idx, 5, 33333);
+		/* FIXME:
+		 * update_gamma value auto clean to 0 by HW, should not
+		 * bakeup it.
+		 */
+		VOP_CTRL_SET(vop, update_gamma_lut, 0);
+	}
+#undef CTRL_GET
+}
+
+void rockchip_vop_crtc_fb_gamma_set(struct drm_crtc *crtc, u16 red, u16 green,
+				    u16 blue, int regno)
+{
+	struct vop *vop = to_vop(crtc);
+	u32 lut_len = vop->lut_len;
+	u32 r, g, b;
+
+	if (regno >= lut_len || !vop->lut)
+		return;
+
+	r = red * (lut_len - 1) / 0xffff;
+	g = green * (lut_len - 1) / 0xffff;
+	b = blue * (lut_len - 1) / 0xffff;
+	vop->lut[regno] = r * lut_len * lut_len + g * lut_len + b;
+}
+
+void rockchip_vop_crtc_fb_gamma_get(struct drm_crtc *crtc, u16 *red, u16 *green,
+				    u16 *blue, int regno)
+{
+	struct vop *vop = to_vop(crtc);
+	u32 lut_len = vop->lut_len;
+	u32 r, g, b;
+
+	if (regno >= lut_len || !vop->lut)
+		return;
+
+	r = (vop->lut[regno] / lut_len / lut_len) & (lut_len - 1);
+	g = (vop->lut[regno] / lut_len) & (lut_len - 1);
+	b = vop->lut[regno] & (lut_len - 1);
+	*red = r * 0xffff / (lut_len - 1);
+	*green = g * 0xffff / (lut_len - 1);
+	*blue = b * 0xffff / (lut_len - 1);
+}
+
 static void vop_power_enable(struct drm_crtc *crtc)
 {
 	struct vop *vop = to_vop(crtc);
@@ -811,12 +939,19 @@ err_disable_hclk:
 static void vop_initial(struct drm_crtc *crtc)
 {
 	struct vop *vop = to_vop(crtc);
+	uint32_t irqs;
 	int i;
 
 	vop_power_enable(crtc);
 
 	VOP_CTRL_SET(vop, global_regdone_en, 1);
 	VOP_CTRL_SET(vop, dsp_blank, 0);
+
+	/*
+	 * restore the lut table.
+	 */
+	if (vop->lut_active)
+		vop_crtc_load_lut(crtc);
 
 	/*
 	 * We need to make sure that all windows are disabled before resume
@@ -838,12 +973,19 @@ static void vop_initial(struct drm_crtc *crtc)
 		VOP_WIN_SET(vop, win, gate, 1);
 	}
 	VOP_CTRL_SET(vop, afbdc_en, 0);
+
+	irqs = BUS_ERROR_INTR | WIN0_EMPTY_INTR | WIN1_EMPTY_INTR |
+		WIN2_EMPTY_INTR | WIN3_EMPTY_INTR | HWC_EMPTY_INTR |
+		POST_BUF_EMPTY_INTR;
+	VOP_INTR_SET_TYPE(vop, clear, irqs, 1);
+	VOP_INTR_SET_TYPE(vop, enable, irqs, 1);
 }
 
 static void vop_crtc_disable(struct drm_crtc *crtc)
 {
 	struct vop *vop = to_vop(crtc);
 
+	mutex_lock(&vop->vop_lock);
 	drm_crtc_vblank_off(crtc);
 
 	/*
@@ -882,6 +1024,7 @@ static void vop_crtc_disable(struct drm_crtc *crtc)
 	clk_disable_unprepare(vop->dclk);
 	clk_disable_unprepare(vop->aclk);
 	clk_disable_unprepare(vop->hclk);
+	mutex_unlock(&vop->vop_lock);
 }
 
 static void vop_plane_destroy(struct drm_plane *plane)
@@ -995,7 +1138,8 @@ static int vop_plane_atomic_check(struct drm_plane *plane,
 	}
 
 	offset = (src->x1 >> 16) * drm_format_plane_bpp(fb->pixel_format, 0) / 8;
-	if (state->rotation & BIT(DRM_REFLECT_Y))
+	if (state->rotation & BIT(DRM_REFLECT_Y) ||
+	    (rockchip_fb_is_logo(fb) && vop_plane_state->logo_ymirror))
 		offset += ((src->y2 >> 16) - 1) * fb->pitches[0];
 	else
 		offset += (src->y1 >> 16) * fb->pitches[0];
@@ -1097,7 +1241,8 @@ static void vop_plane_atomic_update(struct drm_plane *plane,
 	dsp_sty = dest->y1 + crtc->mode.vtotal - crtc->mode.vsync_start;
 	dsp_st = dsp_sty << 16 | (dsp_stx & 0xffff);
 
-	ymirror = !!(state->rotation & BIT(DRM_REFLECT_Y));
+	ymirror = state->rotation & BIT(DRM_REFLECT_Y) ||
+		  (rockchip_fb_is_logo(fb) && vop_plane_state->logo_ymirror);
 	xmirror = !!(state->rotation & BIT(DRM_REFLECT_X));
 
 	vop = to_vop(state->crtc);
@@ -1220,6 +1365,7 @@ static int vop_atomic_plane_set_property(struct drm_plane *plane,
 					 struct drm_property *property,
 					 uint64_t val)
 {
+	struct rockchip_drm_private *private = plane->dev->dev_private;
 	struct vop_win *win = to_vop_win(plane);
 	struct vop_plane_state *plane_state = to_vop_plane_state(state);
 
@@ -1230,6 +1376,12 @@ static int vop_atomic_plane_set_property(struct drm_plane *plane,
 
 	if (property == win->rotation_prop) {
 		state->rotation = val;
+		return 0;
+	}
+
+	if (property == private->logo_ymirror_prop) {
+		WARN_ON(!rockchip_fb_is_logo(state->fb));
+		plane_state->logo_ymirror = val;
 		return 0;
 	}
 
@@ -1264,6 +1416,7 @@ static const struct drm_plane_funcs vop_plane_funcs = {
 	.disable_plane	= drm_atomic_helper_disable_plane,
 	.destroy = vop_plane_destroy,
 	.reset = vop_atomic_plane_reset,
+	.set_property = drm_atomic_helper_plane_set_property,
 	.atomic_duplicate_state = vop_atomic_plane_duplicate_state,
 	.atomic_destroy_state = vop_atomic_plane_destroy_state,
 	.atomic_set_property = vop_atomic_plane_set_property,
@@ -1303,14 +1456,6 @@ static void vop_crtc_disable_vblank(struct drm_crtc *crtc)
 	spin_unlock_irqrestore(&vop->irq_lock, flags);
 }
 
-static void vop_crtc_wait_for_update(struct drm_crtc *crtc)
-{
-	struct vop *vop = to_vop(crtc);
-
-	reinit_completion(&vop->wait_update_complete);
-	WARN_ON(!wait_for_completion_timeout(&vop->wait_update_complete, 100));
-}
-
 static void vop_crtc_cancel_pending_vblank(struct drm_crtc *crtc,
 					   struct drm_file *file_priv)
 {
@@ -1332,12 +1477,27 @@ static void vop_crtc_cancel_pending_vblank(struct drm_crtc *crtc,
 
 static int vop_crtc_loader_protect(struct drm_crtc *crtc, bool on)
 {
+	struct rockchip_drm_private *private = crtc->dev->dev_private;
 	struct vop *vop = to_vop(crtc);
 
 	if (on == vop->loader_protect)
 		return 0;
 
 	if (on) {
+		if (vop->dclk_source) {
+			struct clk *parent;
+
+			parent = clk_get_parent(vop->dclk_source);
+			if (parent) {
+				if (clk_is_match(private->default_pll.pll, parent))
+					vop->pll = &private->default_pll;
+				else if (clk_is_match(private->hdmi_pll.pll, parent))
+					vop->pll = &private->hdmi_pll;
+				if (vop->pll)
+					vop->pll->use_count++;
+			}
+		}
+
 		vop_power_enable(crtc);
 		enable_irq(vop->irq);
 		drm_crtc_vblank_on(crtc);
@@ -1345,11 +1505,23 @@ static int vop_crtc_loader_protect(struct drm_crtc *crtc, bool on)
 	} else {
 		vop_crtc_disable(crtc);
 
+		if (vop->dclk_source && vop->pll) {
+			vop->pll->use_count--;
+			vop->pll = NULL;
+		}
 		vop->loader_protect = false;
 	}
 
 	return 0;
 }
+
+#define DEBUG_PRINT(args...) \
+		do { \
+			if (s) \
+				seq_printf(s, args); \
+			else \
+				printk(args); \
+		} while (0)
 
 static int vop_plane_info_dump(struct seq_file *s, struct drm_plane *plane)
 {
@@ -1360,27 +1532,27 @@ static int vop_plane_info_dump(struct seq_file *s, struct drm_plane *plane)
 	struct drm_framebuffer *fb = state->fb;
 	int i;
 
-	seq_printf(s, "    win%d-%d: %s\n", win->win_id, win->area_id,
-		   pstate->enable ? "ACTIVE" : "DISABLED");
+	DEBUG_PRINT("    win%d-%d: %s\n", win->win_id, win->area_id,
+		    pstate->enable ? "ACTIVE" : "DISABLED");
 	if (!fb)
 		return 0;
 
 	src = &pstate->src;
 	dest = &pstate->dest;
 
-	seq_printf(s, "\tformat: %s%s\n", drm_get_format_name(fb->pixel_format),
-		   fb->modifier[0] == DRM_FORMAT_MOD_ARM_AFBC ? "[AFBC]" : "");
-	seq_printf(s, "\tzpos: %d\n", pstate->zpos);
-	seq_printf(s, "\tsrc: pos[%dx%d] rect[%dx%d]\n", src->x1 >> 16,
-		   src->y1 >> 16, drm_rect_width(src) >> 16,
-		   drm_rect_height(src) >> 16);
-	seq_printf(s, "\tdst: pos[%dx%d] rect[%dx%d]\n", dest->x1, dest->y1,
-		   drm_rect_width(dest), drm_rect_height(dest));
+	DEBUG_PRINT("\tformat: %s%s\n", drm_get_format_name(fb->pixel_format),
+		    fb->modifier[0] == DRM_FORMAT_MOD_ARM_AFBC ? "[AFBC]" : "");
+	DEBUG_PRINT("\tzpos: %d\n", pstate->zpos);
+	DEBUG_PRINT("\tsrc: pos[%dx%d] rect[%dx%d]\n", src->x1 >> 16,
+		    src->y1 >> 16, drm_rect_width(src) >> 16,
+		    drm_rect_height(src) >> 16);
+	DEBUG_PRINT("\tdst: pos[%dx%d] rect[%dx%d]\n", dest->x1, dest->y1,
+		    drm_rect_width(dest), drm_rect_height(dest));
 
 	for (i = 0; i < drm_format_num_planes(fb->pixel_format); i++) {
 		dma_addr_t fb_addr = rockchip_fb_get_dma_addr(fb, i);
-		seq_printf(s, "\tbuf[%d]: addr: %pad pitch: %d offset: %d\n",
-			   i, &fb_addr, fb->pitches[i], fb->offsets[i]);
+		DEBUG_PRINT("\tbuf[%d]: addr: %pad pitch: %d offset: %d\n",
+			    i, &fb_addr, fb->pitches[i], fb->offsets[i]);
 	}
 
 	return 0;
@@ -1396,25 +1568,25 @@ static int vop_crtc_debugfs_dump(struct drm_crtc *crtc, struct seq_file *s)
 	struct drm_plane *plane;
 	int i;
 
-	seq_printf(s, "VOP [%s]: %s\n", dev_name(vop->dev),
-		   crtc_state->active ? "ACTIVE" : "DISABLED");
+	DEBUG_PRINT("VOP [%s]: %s\n", dev_name(vop->dev),
+		    crtc_state->active ? "ACTIVE" : "DISABLED");
 
 	if (!crtc_state->active)
 		return 0;
 
-	seq_printf(s, "    Connector: %s\n",
-		   drm_get_connector_name(state->output_type));
-	seq_printf(s, "\tbus_format[%x] output_mode[%x]\n",
-		   state->bus_format, state->output_mode);
-	seq_printf(s, "    Display mode: %dx%d%s%d\n",
-		   mode->hdisplay, mode->vdisplay, interlaced ? "i" : "p",
-		   drm_mode_vrefresh(mode));
-	seq_printf(s, "\tclk[%d] real_clk[%d] type[%x] flag[%x]\n",
-		   mode->clock, mode->crtc_clock, mode->type, mode->flags);
-	seq_printf(s, "\tH: %d %d %d %d\n", mode->hdisplay, mode->hsync_start,
-		   mode->hsync_end, mode->htotal);
-	seq_printf(s, "\tV: %d %d %d %d\n", mode->vdisplay, mode->vsync_start,
-		   mode->vsync_end, mode->vtotal);
+	DEBUG_PRINT("    Connector: %s\n",
+		    drm_get_connector_name(state->output_type));
+	DEBUG_PRINT("\tbus_format[%x] output_mode[%x]\n",
+		    state->bus_format, state->output_mode);
+	DEBUG_PRINT("    Display mode: %dx%d%s%d\n",
+		    mode->hdisplay, mode->vdisplay, interlaced ? "i" : "p",
+		    drm_mode_vrefresh(mode));
+	DEBUG_PRINT("\tclk[%d] real_clk[%d] type[%x] flag[%x]\n",
+		    mode->clock, mode->crtc_clock, mode->type, mode->flags);
+	DEBUG_PRINT("\tH: %d %d %d %d\n", mode->hdisplay, mode->hsync_start,
+		    mode->hsync_end, mode->htotal);
+	DEBUG_PRINT("\tV: %d %d %d %d\n", mode->vdisplay, mode->vsync_start,
+		    mode->vsync_end, mode->vtotal);
 
 	for (i = 0; i < vop->num_wins; i++) {
 		plane = &vop->win[i].base;
@@ -1423,6 +1595,25 @@ static int vop_crtc_debugfs_dump(struct drm_crtc *crtc, struct seq_file *s)
 
 	return 0;
 }
+
+static void vop_crtc_regs_dump(struct drm_crtc *crtc, struct seq_file *s)
+{
+	struct vop *vop = to_vop(crtc);
+	struct drm_crtc_state *crtc_state = crtc->state;
+	int dump_len = vop->len > 0x400 ? 0x400 : vop->len;
+	int i;
+
+	if (!crtc_state->active)
+		return;
+
+	for (i = 0; i < dump_len; i += 4) {
+		if (i % 16 == 0)
+			DEBUG_PRINT("\n0x%08x: ", i);
+		DEBUG_PRINT("%08x ", vop_readl(vop, i));
+	}
+}
+
+#undef DEBUG_PRINT
 
 static enum drm_mode_status
 vop_crtc_mode_valid(struct drm_crtc *crtc, const struct drm_display_mode *mode,
@@ -1435,8 +1626,11 @@ vop_crtc_mode_valid(struct drm_crtc *crtc, const struct drm_display_mode *mode,
 
 	if (mode->hdisplay > vop_data->max_output.width)
 		return MODE_BAD_HVALUE;
-	if (mode->vdisplay > vop_data->max_output.height)
-		return MODE_BAD_VVALUE;
+
+	if ((mode->flags & DRM_MODE_FLAG_INTERLACE) &&
+	    VOP_MAJOR(vop->data->version) == 3 &&
+	    VOP_MINOR(vop->data->version) <= 2)
+		return MODE_BAD;
 
 	if (mode->flags & DRM_MODE_FLAG_DBLCLK)
 		request_clock *= 2;
@@ -1457,9 +1651,9 @@ static const struct rockchip_crtc_funcs private_crtc_funcs = {
 	.loader_protect = vop_crtc_loader_protect,
 	.enable_vblank = vop_crtc_enable_vblank,
 	.disable_vblank = vop_crtc_disable_vblank,
-	.wait_for_update = vop_crtc_wait_for_update,
 	.cancel_pending_vblank = vop_crtc_cancel_pending_vblank,
 	.debugfs_dump = vop_crtc_debugfs_dump,
+	.regs_dump = vop_crtc_regs_dump,
 	.mode_valid = vop_crtc_mode_valid,
 };
 
@@ -1470,8 +1664,7 @@ static bool vop_crtc_mode_fixup(struct drm_crtc *crtc,
 	struct vop *vop = to_vop(crtc);
 	const struct vop_data *vop_data = vop->data;
 
-	if (mode->hdisplay > vop_data->max_output.width ||
-	    mode->vdisplay > vop_data->max_output.height)
+	if (mode->hdisplay > vop_data->max_output.width)
 		return false;
 
 	drm_mode_set_crtcinfo(adj_mode,
@@ -1504,35 +1697,68 @@ static void vop_crtc_enable(struct drm_crtc *crtc)
 	u16 vact_end = vact_st + vdisplay;
 	uint32_t val;
 
+	mutex_lock(&vop->vop_lock);
 	vop_initial(crtc);
 
-	val = BIT(DCLK_INVERT);
-	val |= (adjusted_mode->flags & DRM_MODE_FLAG_NHSYNC) ?
+	VOP_CTRL_SET(vop, dclk_pol, 1);
+	val = (adjusted_mode->flags & DRM_MODE_FLAG_NHSYNC) ?
 		   0 : BIT(HSYNC_POSITIVE);
 	val |= (adjusted_mode->flags & DRM_MODE_FLAG_NVSYNC) ?
 		   0 : BIT(VSYNC_POSITIVE);
 	VOP_CTRL_SET(vop, pin_pol, val);
+
+	if (vop->dclk_source && vop->pll && vop->pll->pll) {
+		if (clk_set_parent(vop->dclk_source, vop->pll->pll))
+			DRM_DEV_ERROR(vop->dev,
+				      "failed to set dclk's parents\n");
+	}
+
 	switch (s->output_type) {
 	case DRM_MODE_CONNECTOR_LVDS:
 		VOP_CTRL_SET(vop, rgb_en, 1);
 		VOP_CTRL_SET(vop, rgb_pin_pol, val);
+		VOP_CTRL_SET(vop, rgb_dclk_pol, 1);
+		VOP_CTRL_SET(vop, lvds_en, 1);
+		VOP_CTRL_SET(vop, lvds_pin_pol, val);
+		VOP_CTRL_SET(vop, lvds_dclk_pol, 1);
 		break;
 	case DRM_MODE_CONNECTOR_eDP:
 		VOP_CTRL_SET(vop, edp_en, 1);
 		VOP_CTRL_SET(vop, edp_pin_pol, val);
+		VOP_CTRL_SET(vop, edp_dclk_pol, 1);
 		break;
 	case DRM_MODE_CONNECTOR_HDMIA:
 		VOP_CTRL_SET(vop, hdmi_en, 1);
 		VOP_CTRL_SET(vop, hdmi_pin_pol, val);
+		VOP_CTRL_SET(vop, hdmi_dclk_pol, 1);
 		break;
 	case DRM_MODE_CONNECTOR_DSI:
 		VOP_CTRL_SET(vop, mipi_en, 1);
 		VOP_CTRL_SET(vop, mipi_pin_pol, val);
+		VOP_CTRL_SET(vop, mipi_dclk_pol, 1);
+		VOP_CTRL_SET(vop, mipi_dual_channel_en,
+			!!(s->output_flags & ROCKCHIP_OUTPUT_DSI_DUAL_CHANNEL));
+		VOP_CTRL_SET(vop, data01_swap,
+			!!(s->output_flags & ROCKCHIP_OUTPUT_DSI_DUAL_LINK));
 		break;
 	case DRM_MODE_CONNECTOR_DisplayPort:
-		val &= ~BIT(DCLK_INVERT);
+		VOP_CTRL_SET(vop, dp_dclk_pol, 0);
 		VOP_CTRL_SET(vop, dp_pin_pol, val);
 		VOP_CTRL_SET(vop, dp_en, 1);
+		break;
+	case DRM_MODE_CONNECTOR_TV:
+		if (vdisplay == CVBS_PAL_VDISPLAY)
+			VOP_CTRL_SET(vop, tve_sw_mode, 1);
+		else
+			VOP_CTRL_SET(vop, tve_sw_mode, 0);
+
+		VOP_CTRL_SET(vop, tve_dclk_pol, 1);
+		VOP_CTRL_SET(vop, tve_dclk_en, 1);
+		/* use the same pol reg with hdmi */
+		VOP_CTRL_SET(vop, hdmi_pin_pol, val);
+		VOP_CTRL_SET(vop, sw_genlock, 1);
+		VOP_CTRL_SET(vop, sw_uv_offset_en, 1);
+		VOP_CTRL_SET(vop, dither_up, 1);
 		break;
 	default:
 		DRM_ERROR("unsupport connector_type[%d]\n", s->output_type);
@@ -1552,9 +1778,11 @@ static void vop_crtc_enable(struct drm_crtc *crtc)
 		val = DITHER_DOWN_EN(1) | DITHER_DOWN_MODE(RGB888_TO_RGB666);
 		break;
 	case MEDIA_BUS_FMT_YUV8_1X24:
+	case MEDIA_BUS_FMT_UYYVYY8_0_5X24:
 		val = DITHER_DOWN_EN(0) | PRE_DITHER_DOWN_EN(1);
 		break;
 	case MEDIA_BUS_FMT_YUV10_1X30:
+	case MEDIA_BUS_FMT_UYYVYY10_0_5X30:
 		val = DITHER_DOWN_EN(0) | PRE_DITHER_DOWN_EN(0);
 		break;
 	case MEDIA_BUS_FMT_RGB888_1X24:
@@ -1573,9 +1801,18 @@ static void vop_crtc_enable(struct drm_crtc *crtc)
 		     s->output_mode == ROCKCHIP_OUT_MODE_YUV420 ? 1 : 0);
 	VOP_CTRL_SET(vop, overlay_mode, is_yuv_output(s->bus_format));
 	VOP_CTRL_SET(vop, dsp_out_yuv, is_yuv_output(s->bus_format));
-	VOP_CTRL_SET(vop, dsp_background,
-		     is_yuv_output(s->bus_format) ? 0x20010200 : 0);
 
+	/*
+	 * Background color is 10bit depth if vop version >= 3.5
+	 */
+	if (!is_yuv_output(s->bus_format))
+		val = 0;
+	else if (VOP_MAJOR(vop->data->version) == 3 &&
+		 VOP_MINOR(vop->data->version) >= 5)
+		val = 0x20010200;
+	else
+		val = 0x801080;
+	VOP_CTRL_SET(vop, dsp_background, val);
 	VOP_CTRL_SET(vop, htotal_pw, (htotal << 16) | hsync_len);
 	val = hact_st << 16;
 	val |= hact_end;
@@ -1586,6 +1823,10 @@ static void vop_crtc_enable(struct drm_crtc *crtc)
 	val |= vact_end;
 	VOP_CTRL_SET(vop, vact_st_end, val);
 	VOP_CTRL_SET(vop, vpost_st_end, val);
+
+	VOP_INTR_SET(vop, line_flag_num[0], vact_end);
+	VOP_INTR_SET(vop, line_flag_num[1],
+		     vact_end - us_to_vertical_line(adjusted_mode, 1000));
 	if (adjusted_mode->flags & DRM_MODE_FLAG_INTERLACE) {
 		u16 vact_st_f1 = vtotal + vact_st + 1;
 		u16 vact_end_f1 = vact_st_f1 + vdisplay;
@@ -1598,7 +1839,7 @@ static void vop_crtc_enable(struct drm_crtc *crtc)
 		VOP_CTRL_SET(vop, vs_st_end_f1, val);
 		VOP_CTRL_SET(vop, dsp_interlace, 1);
 		VOP_CTRL_SET(vop, p2i_en, 1);
-		vtotal = vtotal + 1;
+		vtotal += vtotal + 1;
 	} else {
 		VOP_CTRL_SET(vop, dsp_interlace, 0);
 		VOP_CTRL_SET(vop, p2i_en, 0);
@@ -1607,6 +1848,13 @@ static void vop_crtc_enable(struct drm_crtc *crtc)
 
 	VOP_CTRL_SET(vop, core_dclk_div,
 		     !!(adjusted_mode->flags & DRM_MODE_FLAG_DBLCLK));
+
+	VOP_CTRL_SET(vop, cabc_total_num, hdisplay * vdisplay);
+	VOP_CTRL_SET(vop, cabc_config_mode, STAGE_BY_STAGE);
+	VOP_CTRL_SET(vop, cabc_stage_up_mode, MUL_MODE);
+	VOP_CTRL_SET(vop, cabc_scale_cfg_value, 1);
+	VOP_CTRL_SET(vop, cabc_scale_cfg_enable, 0);
+	VOP_CTRL_SET(vop, cabc_global_dn_limit_en, 1);
 
 	clk_set_rate(vop->dclk, adjusted_mode->crtc_clock * 1000);
 
@@ -1618,6 +1866,7 @@ static void vop_crtc_enable(struct drm_crtc *crtc)
 
 	enable_irq(vop->irq);
 	drm_crtc_vblank_on(crtc);
+	mutex_unlock(&vop->vop_lock);
 }
 
 static int vop_zpos_cmp(const void *a, const void *b)
@@ -1700,6 +1949,41 @@ static int vop_afbdc_atomic_check(struct drm_crtc *crtc,
 	return 0;
 }
 
+static void vop_dclk_source_generate(struct drm_crtc *crtc,
+				     struct drm_crtc_state *crtc_state)
+{
+	struct rockchip_drm_private *private = crtc->dev->dev_private;
+	struct rockchip_crtc_state *s = to_rockchip_crtc_state(crtc_state);
+	struct rockchip_crtc_state *old_s = to_rockchip_crtc_state(crtc->state);
+	struct vop *vop = to_vop(crtc);
+	struct rockchip_dclk_pll *old_pll = vop->pll;
+
+	if (!vop->dclk_source)
+		return;
+
+	if (crtc_state->active) {
+		WARN_ON(vop->pll && !vop->pll->use_count);
+		if (!vop->pll || vop->pll->use_count > 1 ||
+		    s->output_type != old_s->output_type) {
+			if (vop->pll)
+				vop->pll->use_count--;
+
+			if (s->output_type != DRM_MODE_CONNECTOR_HDMIA &&
+			    !private->default_pll.use_count)
+				vop->pll = &private->default_pll;
+			else
+				vop->pll = &private->hdmi_pll;
+
+			vop->pll->use_count++;
+		}
+	} else if (vop->pll) {
+		vop->pll->use_count--;
+		vop->pll = NULL;
+	}
+	if (vop->pll != old_pll)
+		crtc_state->mode_changed = true;
+}
+
 static int vop_crtc_atomic_check(struct drm_crtc *crtc,
 				 struct drm_crtc_state *crtc_state)
 {
@@ -1753,7 +2037,11 @@ static int vop_crtc_atomic_check(struct drm_crtc *crtc,
 		if (!pstate)
 			pstate = plane->state;
 		plane_state = to_vop_plane_state(pstate);
-		pzpos[cnt].zpos = plane_state->zpos;
+
+		if (!plane_state->enable)
+			pzpos[cnt].zpos = INT_MAX;
+		else
+			pzpos[cnt].zpos = plane_state->zpos;
 		pzpos[cnt++].win_id = win->win_id;
 	}
 
@@ -1773,6 +2061,8 @@ static int vop_crtc_atomic_check(struct drm_crtc *crtc,
 	}
 
 	s->dsp_layer_sel = dsp_layer_sel;
+
+	vop_dclk_source_generate(crtc, crtc_state);
 
 err_free_pzpos:
 	kfree(pzpos);
@@ -1807,13 +2097,98 @@ static void vop_post_config(struct drm_crtc *crtc)
 	val = scl_cal_scale2(vdisplay, vsize) << 16;
 	val |= scl_cal_scale2(hdisplay, hsize);
 	VOP_CTRL_SET(vop, post_scl_factor, val);
-	VOP_CTRL_SET(vop, post_scl_ctrl, 0x3);
+
+#define POST_HORIZONTAL_SCALEDOWN_EN(x)		((x) << 0)
+#define POST_VERTICAL_SCALEDOWN_EN(x)		((x) << 1)
+	VOP_CTRL_SET(vop, post_scl_ctrl,
+		     POST_HORIZONTAL_SCALEDOWN_EN(hdisplay != hsize) |
+		     POST_VERTICAL_SCALEDOWN_EN(vdisplay != vsize));
 	if (mode->flags & DRM_MODE_FLAG_INTERLACE) {
 		u16 vact_st_f1 = vtotal + vact_st + 1;
 		u16 vact_end_f1 = vact_st_f1 + vsize;
 
 		val = vact_st_f1 << 16 | vact_end_f1;
 		VOP_CTRL_SET(vop, vpost_st_end_f1, val);
+	}
+}
+
+static void vop_update_cabc_lut(struct drm_crtc *crtc,
+			    struct drm_crtc_state *old_crtc_state)
+{
+	struct rockchip_crtc_state *s =
+			to_rockchip_crtc_state(crtc->state);
+	struct rockchip_crtc_state *old_s =
+			to_rockchip_crtc_state(old_crtc_state);
+	struct drm_property_blob *cabc_lut = s->cabc_lut;
+	struct drm_property_blob *old_cabc_lut = old_s->cabc_lut;
+	struct vop *vop = to_vop(crtc);
+	int lut_size;
+	u32 *lut;
+	u32 lut_len = vop->cabc_lut_len;
+	int i, dle;
+
+	if (!cabc_lut && old_cabc_lut) {
+		VOP_CTRL_SET(vop, cabc_lut_en, 0);
+		return;
+	}
+	if (!cabc_lut)
+		return;
+
+	if (old_cabc_lut && old_cabc_lut->base.id == cabc_lut->base.id)
+		return;
+
+	lut = (u32 *)cabc_lut->data;
+	lut_size = cabc_lut->length / sizeof(u32);
+	if (WARN(lut_size != lut_len, "Unexpect cabc lut size not match\n"))
+		return;
+
+#define CTRL_GET(name) VOP_CTRL_GET(vop, name)
+	if (CTRL_GET(cabc_lut_en)) {
+		VOP_CTRL_SET(vop, cabc_lut_en, 0);
+		vop_cfg_done(vop);
+		readx_poll_timeout(CTRL_GET, cabc_lut_en, dle, !dle, 5, 33333);
+	}
+
+	for (i = 0; i < lut_len; i++)
+		vop_write_cabc_lut(vop, (i << 2), lut[i]);
+#undef CTRL_GET
+	VOP_CTRL_SET(vop, cabc_lut_en, 1);
+}
+
+static void vop_update_cabc(struct drm_crtc *crtc,
+			    struct drm_crtc_state *old_crtc_state)
+{
+	struct rockchip_crtc_state *s =
+			to_rockchip_crtc_state(crtc->state);
+	struct vop *vop = to_vop(crtc);
+	struct drm_display_mode *mode = &crtc->state->adjusted_mode;
+	int pixel_total = mode->hdisplay * mode->vdisplay;
+
+	if (!vop->cabc_lut_regs)
+		return;
+
+	vop_update_cabc_lut(crtc, old_crtc_state);
+
+	if (s->cabc_mode != ROCKCHIP_DRM_CABC_MODE_DISABLE) {
+		VOP_CTRL_SET(vop, cabc_en, 1);
+		VOP_CTRL_SET(vop, cabc_handle_en, 1);
+		VOP_CTRL_SET(vop, cabc_stage_up, s->cabc_stage_up);
+		VOP_CTRL_SET(vop, cabc_stage_down, s->cabc_stage_down);
+		VOP_CTRL_SET(vop, cabc_global_dn, s->cabc_global_dn);
+		VOP_CTRL_SET(vop, cabc_calc_pixel_num,
+			     s->cabc_calc_pixel_num * pixel_total / 1000);
+	} else {
+		/*
+		 * There are some hardware issues on cabc disabling:
+		 *   1: if cabc auto gating enable, cabc disabling will cause
+		 *      vop die
+		 *   2: cabc disabling always would make timing several
+		 *      pixel cycle abnormal, cause some panel abnormal.
+		 *
+		 * So just keep cabc enable, and make it no work with max
+		 * cabc_calc_pixel_num, it only has little power consume.
+		 */
+		VOP_CTRL_SET(vop, cabc_calc_pixel_num, pixel_total);
 	}
 }
 
@@ -1845,10 +2220,40 @@ static void vop_cfg_update(struct drm_crtc *crtc,
 	spin_unlock(&vop->reg_lock);
 }
 
+static bool vop_fs_irq_is_pending(struct vop *vop)
+{
+	return VOP_INTR_GET_TYPE(vop, status, FS_INTR);
+}
+
+static void vop_wait_for_irq_handler(struct vop *vop)
+{
+	bool pending;
+	int ret;
+
+	/*
+	 * Spin until frame start interrupt status bit goes low, which means
+	 * that interrupt handler was invoked and cleared it. The timeout of
+	 * 10 msecs is really too long, but it is just a safety measure if
+	 * something goes really wrong. The wait will only happen in the very
+	 * unlikely case of a vblank happening exactly at the same time and
+	 * shouldn't exceed microseconds range.
+	 */
+	ret = readx_poll_timeout_atomic(vop_fs_irq_is_pending, vop, pending,
+					!pending, 0, 10 * 1000);
+	if (ret)
+		DRM_DEV_ERROR(vop->dev, "VOP vblank IRQ stuck for 10 ms\n");
+
+	synchronize_irq(vop->irq);
+}
+
 static void vop_crtc_atomic_flush(struct drm_crtc *crtc,
 				  struct drm_crtc_state *old_crtc_state)
 {
+	struct drm_atomic_state *old_state = old_crtc_state->state;
+	struct drm_plane_state *old_plane_state;
 	struct vop *vop = to_vop(crtc);
+	struct drm_plane *plane;
+	int i;
 
 	vop_cfg_update(crtc, old_crtc_state);
 
@@ -1893,23 +2298,48 @@ static void vop_crtc_atomic_flush(struct drm_crtc *crtc,
 		vop->is_iommu_enabled = true;
 	}
 
+	vop_update_cabc(crtc, old_crtc_state);
+
 	vop_cfg_done(vop);
+
+	/*
+	 * There is a (rather unlikely) possiblity that a vblank interrupt
+	 * fired before we set the cfg_done bit. To avoid spuriously
+	 * signalling flip completion we need to wait for it to finish.
+	 */
+	vop_wait_for_irq_handler(vop);
+
+	spin_lock_irq(&crtc->dev->event_lock);
+	if (crtc->state->event) {
+		WARN_ON(drm_crtc_vblank_get(crtc) != 0);
+		WARN_ON(vop->event);
+
+		vop->event = crtc->state->event;
+		crtc->state->event = NULL;
+	}
+	spin_unlock_irq(&crtc->dev->event_lock);
+
+	for_each_plane_in_state(old_state, plane, old_plane_state, i) {
+		if (!old_plane_state->fb)
+			continue;
+
+		if (old_plane_state->fb == plane->state->fb)
+			continue;
+
+		drm_framebuffer_reference(old_plane_state->fb);
+		WARN_ON(drm_crtc_vblank_get(crtc) != 0);
+		drm_flip_work_queue(&vop->fb_unref_work, old_plane_state->fb);
+		set_bit(VOP_PENDING_FB_UNREF, &vop->pending);
+	}
 }
 
 static void vop_crtc_atomic_begin(struct drm_crtc *crtc,
 				  struct drm_crtc_state *old_crtc_state)
 {
-	struct vop *vop = to_vop(crtc);
-
-	if (crtc->state->event) {
-		WARN_ON(drm_crtc_vblank_get(crtc) != 0);
-
-		vop->event = crtc->state->event;
-		crtc->state->event = NULL;
-	}
 }
 
 static const struct drm_crtc_helper_funcs vop_crtc_helper_funcs = {
+	.load_lut = vop_crtc_load_lut,
 	.enable = vop_crtc_enable,
 	.disable = vop_crtc_disable,
 	.mode_fixup = vop_crtc_mode_fixup,
@@ -1937,6 +2367,7 @@ static void vop_crtc_reset(struct drm_crtc *crtc)
 		return;
 	crtc->state = &s->base;
 	crtc->state->crtc = crtc;
+
 	s->left_margin = 100;
 	s->right_margin = 100;
 	s->top_margin = 100;
@@ -1971,6 +2402,7 @@ static int vop_crtc_atomic_get_property(struct drm_crtc *crtc,
 					uint64_t *val)
 {
 	struct drm_device *drm_dev = crtc->dev;
+	struct rockchip_drm_private *private = drm_dev->dev_private;
 	struct drm_mode_config *mode_config = &drm_dev->mode_config;
 	struct rockchip_crtc_state *s = to_rockchip_crtc_state(state);
 
@@ -1994,6 +2426,36 @@ static int vop_crtc_atomic_get_property(struct drm_crtc *crtc,
 		return 0;
 	}
 
+	if (property == private->cabc_mode_property) {
+		*val = s->cabc_mode;
+		return 0;
+	}
+
+	if (property == private->cabc_stage_up_property) {
+		*val = s->cabc_stage_up;
+		return 0;
+	}
+
+	if (property == private->cabc_stage_down_property) {
+		*val = s->cabc_stage_down;
+		return 0;
+	}
+
+	if (property == private->cabc_global_dn_property) {
+		*val = s->cabc_global_dn;
+		return 0;
+	}
+
+	if (property == private->cabc_calc_pixel_num_property) {
+		*val = s->cabc_calc_pixel_num;
+		return 0;
+	}
+
+	if (property == private->cabc_lut_property) {
+		*val = s->cabc_lut ? s->cabc_lut->base.id : 0;
+		return 0;
+	}
+
 	DRM_ERROR("failed to get vop crtc property\n");
 	return -EINVAL;
 }
@@ -2004,8 +2466,10 @@ static int vop_crtc_atomic_set_property(struct drm_crtc *crtc,
 					uint64_t val)
 {
 	struct drm_device *drm_dev = crtc->dev;
+	struct rockchip_drm_private *private = drm_dev->dev_private;
 	struct drm_mode_config *mode_config = &drm_dev->mode_config;
 	struct rockchip_crtc_state *s = to_rockchip_crtc_state(state);
+	struct vop *vop = to_vop(crtc);
 
 	if (property == mode_config->tv_left_margin_property) {
 		s->left_margin = val;
@@ -2027,29 +2491,105 @@ static int vop_crtc_atomic_set_property(struct drm_crtc *crtc,
 		return 0;
 	}
 
+	if (property == private->cabc_mode_property) {
+		s->cabc_mode = val;
+		/*
+		 * Pre-define lowpower and normal mode to make cabc
+		 * easier to use.
+		 */
+		if (s->cabc_mode == ROCKCHIP_DRM_CABC_MODE_NORMAL) {
+			s->cabc_stage_up = 257;
+			s->cabc_stage_down = 255;
+			s->cabc_global_dn = 192;
+			s->cabc_calc_pixel_num = 995;
+		} else if (s->cabc_mode == ROCKCHIP_DRM_CABC_MODE_LOWPOWER) {
+			s->cabc_stage_up = 260;
+			s->cabc_stage_down = 252;
+			s->cabc_global_dn = 180;
+			s->cabc_calc_pixel_num = 992;
+		}
+		return 0;
+	}
+
+	if (property == private->cabc_stage_up_property) {
+		s->cabc_stage_up = val;
+		return 0;
+	}
+
+	if (property == private->cabc_stage_down_property) {
+		s->cabc_stage_down = val;
+		return 0;
+	}
+
+	if (property == private->cabc_calc_pixel_num_property) {
+		s->cabc_calc_pixel_num = val;
+		return 0;
+	}
+
+	if (property == private->cabc_global_dn_property) {
+		s->cabc_global_dn = val;
+		return 0;
+	}
+
+	if (property == private->cabc_lut_property) {
+		bool replaced;
+		ssize_t size = vop->cabc_lut_len * 4;
+
+		return drm_atomic_replace_property_blob_from_id(crtc,
+								&s->cabc_lut,
+								val,
+								size,
+								&replaced);
+	}
+
 	DRM_ERROR("failed to set vop crtc property\n");
 	return -EINVAL;
 }
 
+static void vop_crtc_gamma_set(struct drm_crtc *crtc, u16 *red, u16 *green,
+			       u16 *blue, uint32_t start, uint32_t size)
+{
+	struct vop *vop = to_vop(crtc);
+	int end = min_t(u32, start + size, vop->lut_len);
+	int i;
+
+	if (!vop->lut)
+		return;
+
+	for (i = start; i < end; i++)
+		rockchip_vop_crtc_fb_gamma_set(crtc, red[i], green[i],
+					       blue[i], i);
+
+	vop_crtc_load_lut(crtc);
+}
+
 static const struct drm_crtc_funcs vop_crtc_funcs = {
+	.gamma_set = vop_crtc_gamma_set,
 	.set_config = drm_atomic_helper_set_config,
 	.page_flip = drm_atomic_helper_page_flip,
 	.destroy = vop_crtc_destroy,
 	.reset = vop_crtc_reset,
+	.set_property = drm_atomic_helper_crtc_set_property,
 	.atomic_get_property = vop_crtc_atomic_get_property,
 	.atomic_set_property = vop_crtc_atomic_set_property,
 	.atomic_duplicate_state = vop_crtc_duplicate_state,
 	.atomic_destroy_state = vop_crtc_destroy_state,
 };
 
+static void vop_fb_unref_worker(struct drm_flip_work *work, void *val)
+{
+	struct vop *vop = container_of(work, struct vop, fb_unref_work);
+	struct drm_framebuffer *fb = val;
+
+	drm_crtc_vblank_put(&vop->crtc);
+	drm_framebuffer_unreference(fb);
+}
+
 static void vop_handle_vblank(struct vop *vop)
 {
 	struct drm_device *drm = vop->drm_dev;
 	struct drm_crtc *crtc = &vop->crtc;
 	unsigned long flags;
-
-	if (!vop_is_cfg_done_complete(vop))
-		return;
 
 	if (vop->event) {
 		spin_lock_irqsave(&drm->event_lock, flags);
@@ -2060,8 +2600,9 @@ static void vop_handle_vblank(struct vop *vop)
 
 		spin_unlock_irqrestore(&drm->event_lock, flags);
 	}
-	if (!completion_done(&vop->wait_update_complete))
-		complete(&vop->wait_update_complete);
+
+	if (test_and_clear_bit(VOP_PENDING_FB_UNREF, &vop->pending))
+		drm_flip_work_commit(&vop->fb_unref_work, system_unbound_wq);
 }
 
 static irqreturn_t vop_isr(int irq, void *data)
@@ -2108,6 +2649,23 @@ static irqreturn_t vop_isr(int irq, void *data)
 		ret = IRQ_HANDLED;
 	}
 
+#define ERROR_HANDLER(x) \
+	do { \
+		if (active_irqs & x##_INTR) {\
+			DRM_DEV_ERROR_RATELIMITED(vop->dev, #x " irq err\n"); \
+			active_irqs &= ~x##_INTR; \
+			ret = IRQ_HANDLED; \
+		} \
+	} while (0)
+
+	ERROR_HANDLER(BUS_ERROR);
+	ERROR_HANDLER(WIN0_EMPTY);
+	ERROR_HANDLER(WIN1_EMPTY);
+	ERROR_HANDLER(WIN2_EMPTY);
+	ERROR_HANDLER(WIN3_EMPTY);
+	ERROR_HANDLER(HWC_EMPTY);
+	ERROR_HANDLER(POST_BUF_EMPTY);
+
 	/* Unhandled irqs are spurious. */
 	if (active_irqs)
 		DRM_ERROR("Unknown VOP IRQs: %#02x\n", active_irqs);
@@ -2118,6 +2676,7 @@ static irqreturn_t vop_isr(int irq, void *data)
 static int vop_plane_init(struct vop *vop, struct vop_win *win,
 			  unsigned long possible_crtcs)
 {
+	struct rockchip_drm_private *private = vop->drm_dev->dev_private;
 	struct drm_plane *share = NULL;
 	unsigned int rotations = 0;
 	struct drm_property *prop;
@@ -2141,8 +2700,16 @@ static int vop_plane_init(struct vop *vop, struct vop_win *win,
 	if (VOP_WIN_SUPPORT(vop, win, xmirror))
 		rotations |= BIT(DRM_REFLECT_X);
 
-	if (VOP_WIN_SUPPORT(vop, win, ymirror))
+	if (VOP_WIN_SUPPORT(vop, win, ymirror)) {
 		rotations |= BIT(DRM_REFLECT_Y);
+
+		prop = drm_property_create_bool(vop->drm_dev,
+						DRM_MODE_PROP_ATOMIC,
+						"LOGO_YMIRROR");
+		if (!prop)
+			return -ENOMEM;
+		private->logo_ymirror_prop = prop;
+	}
 
 	if (rotations) {
 		rotations |= BIT(DRM_ROTATE_0);
@@ -2173,6 +2740,7 @@ static int vop_create_crtc(struct vop *vop)
 	struct device *dev = vop->dev;
 	const struct vop_data *vop_data = vop->data;
 	struct drm_device *drm_dev = vop->drm_dev;
+	struct rockchip_drm_private *private = drm_dev->dev_private;
 	struct drm_plane *primary = NULL, *cursor = NULL, *plane, *tmp;
 	struct drm_crtc *crtc = &vop->crtc;
 	struct device_node *port;
@@ -2235,8 +2803,10 @@ static int vop_create_crtc(struct vop *vop)
 		goto err_cleanup_crtc;
 	}
 
+	drm_flip_work_init(&vop->fb_unref_work, "fb_unref",
+			   vop_fb_unref_worker);
+
 	init_completion(&vop->dsp_hold_completion);
-	init_completion(&vop->wait_update_complete);
 	init_completion(&vop->line_flag_completion);
 	crtc->port = port;
 	rockchip_register_crtc_funcs(crtc, &private_crtc_funcs);
@@ -2251,12 +2821,41 @@ static int vop_create_crtc(struct vop *vop)
 	VOP_ATTACH_MODE_CONFIG_PROP(tv_right_margin_property, 100);
 	VOP_ATTACH_MODE_CONFIG_PROP(tv_top_margin_property, 100);
 	VOP_ATTACH_MODE_CONFIG_PROP(tv_bottom_margin_property, 100);
+
 #undef VOP_ATTACH_MODE_CONFIG_PROP
+
+	drm_object_attach_property(&crtc->base, private->cabc_lut_property, 0);
+	drm_object_attach_property(&crtc->base, private->cabc_mode_property, 0);
+	drm_object_attach_property(&crtc->base, private->cabc_stage_up_property, 0);
+	drm_object_attach_property(&crtc->base, private->cabc_stage_down_property, 0);
+	drm_object_attach_property(&crtc->base, private->cabc_global_dn_property, 0);
+	drm_object_attach_property(&crtc->base, private->cabc_calc_pixel_num_property, 0);
 
 	if (vop_data->feature & VOP_FEATURE_AFBDC)
 		feature |= BIT(ROCKCHIP_DRM_CRTC_FEATURE_AFBDC);
 	drm_object_attach_property(&crtc->base, vop->feature_prop,
 				   feature);
+	if (vop->lut_regs) {
+		u16 *r_base, *g_base, *b_base;
+		u32 lut_len = vop->lut_len;
+
+		drm_mode_crtc_set_gamma_size(crtc, lut_len);
+		vop->lut = devm_kmalloc_array(dev, lut_len, sizeof(*vop->lut),
+					      GFP_KERNEL);
+		if (!vop->lut)
+			return -ENOMEM;
+
+		r_base = crtc->gamma_store;
+		g_base = r_base + crtc->gamma_size;
+		b_base = g_base + crtc->gamma_size;
+
+		for (i = 0; i < lut_len; i++) {
+			vop->lut[i] = i * lut_len * lut_len | i * lut_len | i;
+			rockchip_vop_crtc_fb_gamma_get(crtc, &r_base[i],
+						       &g_base[i], &b_base[i],
+						       i);
+		}
+	}
 
 	return 0;
 
@@ -2297,6 +2896,7 @@ static void vop_destroy_crtc(struct vop *vop)
 	 * references the CRTC.
 	 */
 	drm_crtc_cleanup(crtc);
+	drm_flip_work_cleanup(&vop->fb_unref_work);
 }
 
 /*
@@ -2400,15 +3000,22 @@ int rockchip_drm_wait_line_flag(struct drm_crtc *crtc, unsigned int line_num,
 {
 	struct vop *vop = to_vop(crtc);
 	unsigned long jiffies_left;
+	int ret = 0;
 
 	if (!crtc || !vop->is_enabled)
 		return -ENODEV;
 
-	if (line_num > crtc->mode.vtotal || mstimeout <= 0)
-		return -EINVAL;
+	mutex_lock(&vop->vop_lock);
 
-	if (vop_line_flag_irq_is_enabled(vop))
-		return -EBUSY;
+	if (line_num > crtc->mode.vtotal || mstimeout <= 0) {
+		ret = -EINVAL;
+		goto out;
+	}
+
+	if (vop_line_flag_irq_is_enabled(vop)) {
+		ret = -EBUSY;
+		goto out;
+	}
 
 	reinit_completion(&vop->line_flag_completion);
 	vop_line_flag_irq_enable(vop, line_num);
@@ -2419,12 +3026,76 @@ int rockchip_drm_wait_line_flag(struct drm_crtc *crtc, unsigned int line_num,
 
 	if (jiffies_left == 0) {
 		dev_err(vop->dev, "Timeout waiting for IRQ\n");
-		return -ETIMEDOUT;
+		ret = -ETIMEDOUT;
+		goto out;
 	}
+
+out:
+	mutex_unlock(&vop->vop_lock);
+
+	return ret;
+}
+EXPORT_SYMBOL(rockchip_drm_wait_line_flag);
+
+static int dmc_notifier_call(struct notifier_block *nb, unsigned long event,
+			     void *data)
+{
+	struct vop *vop = container_of(nb, struct vop, dmc_nb);
+
+	if (event == DEVFREQ_PRECHANGE)
+		mutex_lock(&vop->vop_lock);
+	else if (event == DEVFREQ_POSTCHANGE)
+		mutex_unlock(&vop->vop_lock);
+
+	return NOTIFY_OK;
+}
+
+int rockchip_drm_register_notifier_to_dmc(struct devfreq *devfreq)
+{
+	int i, j = 0;
+
+	mutex_lock(&register_devfreq_lock);
+
+	devfreq_vop = devfreq;
+
+	for (i = 0; i < ARRAY_SIZE(dmc_vop); i++) {
+		if (!dmc_vop[i])
+			continue;
+		dmc_vop[i]->dmc_nb.notifier_call = dmc_notifier_call;
+		devfreq_register_notifier(devfreq_vop, &dmc_vop[i]->dmc_nb,
+					  DEVFREQ_TRANSITION_NOTIFIER);
+		j++;
+	}
+
+	mutex_unlock(&register_devfreq_lock);
+
+	if (j == 0)
+		return -ENOMEM;
 
 	return 0;
 }
-EXPORT_SYMBOL(rockchip_drm_wait_line_flag);
+EXPORT_SYMBOL(rockchip_drm_register_notifier_to_dmc);
+
+static void vop_backlight_config_done(struct device *dev, bool async)
+{
+	struct vop *vop = dev_get_drvdata(dev);
+
+	if (vop && vop->is_enabled) {
+		int dle;
+
+		vop_cfg_done(vop);
+		if (!async) {
+			#define CTRL_GET(name) VOP_CTRL_GET(vop, name)
+			readx_poll_timeout(CTRL_GET, cfg_done,
+					   dle, !dle, 5, 33333);
+			#undef CTRL_GET
+		}
+	}
+}
+
+static const struct rockchip_sub_backlight_ops rockchip_sub_backlight_ops = {
+	.config_done = vop_backlight_config_done,
+};
 
 static int vop_bind(struct device *dev, struct device *master, void *data)
 {
@@ -2463,15 +3134,50 @@ static int vop_bind(struct device *dev, struct device *master, void *data)
 	if (ret)
 		return ret;
 
-	res = platform_get_resource(pdev, IORESOURCE_MEM, 0);
-	vop->len = resource_size(res);
+	res = platform_get_resource_byname(pdev, IORESOURCE_MEM, "regs");
+	if (!res) {
+		dev_warn(vop->dev, "failed to get vop register byname\n");
+		res = platform_get_resource(pdev, IORESOURCE_MEM, 0);
+	}
 	vop->regs = devm_ioremap_resource(dev, res);
 	if (IS_ERR(vop->regs))
 		return PTR_ERR(vop->regs);
+	vop->len = resource_size(res);
 
 	vop->regsbak = devm_kzalloc(dev, vop->len, GFP_KERNEL);
 	if (!vop->regsbak)
 		return -ENOMEM;
+
+	res = platform_get_resource_byname(pdev, IORESOURCE_MEM, "gamma_lut");
+	vop->lut_regs = devm_ioremap_resource(dev, res);
+	if (IS_ERR(vop->lut_regs)) {
+		dev_warn(vop->dev, "failed to get vop lut registers\n");
+		vop->lut_regs = NULL;
+	}
+	if (vop->lut_regs) {
+		vop->lut_len = resource_size(res) / sizeof(*vop->lut);
+		if (vop->lut_len != 256 && vop->lut_len != 1024) {
+			dev_err(vop->dev, "unsupport lut sizes %d\n",
+				vop->lut_len);
+			return -EINVAL;
+		}
+	}
+
+	res = platform_get_resource_byname(pdev, IORESOURCE_MEM, "cabc_lut");
+	vop->cabc_lut_regs = devm_ioremap_resource(dev, res);
+	if (IS_ERR(vop->cabc_lut_regs)) {
+		dev_warn(vop->dev, "failed to get vop cabc lut registers\n");
+		vop->cabc_lut_regs = NULL;
+	}
+
+	if (vop->cabc_lut_regs) {
+		vop->cabc_lut_len = resource_size(res) >> 2;
+		if (vop->cabc_lut_len != 128) {
+			dev_err(vop->dev, "unsupport cabc lut sizes %d\n",
+				vop->cabc_lut_len);
+			return -EINVAL;
+		}
+	}
 
 	vop->hclk = devm_clk_get(vop->dev, "hclk_vop");
 	if (IS_ERR(vop->hclk)) {
@@ -2489,6 +3195,16 @@ static int vop_bind(struct device *dev, struct device *master, void *data)
 		return PTR_ERR(vop->dclk);
 	}
 
+	vop->dclk_source = devm_clk_get(vop->dev, "dclk_source");
+	if (PTR_ERR(vop->dclk_source) == -ENOENT) {
+		vop->dclk_source = NULL;
+	} else if (PTR_ERR(vop->dclk_source) == -EPROBE_DEFER) {
+		return -EPROBE_DEFER;
+	} else if (IS_ERR(vop->dclk_source)) {
+		dev_err(vop->dev, "failed to get dclk source parent\n");
+		return PTR_ERR(vop->dclk_source);
+	}
+
 	irq = platform_get_irq(pdev, 0);
 	if (irq < 0) {
 		dev_err(dev, "cannot find irq for vop\n");
@@ -2498,6 +3214,7 @@ static int vop_bind(struct device *dev, struct device *master, void *data)
 
 	spin_lock_init(&vop->reg_lock);
 	spin_lock_init(&vop->irq_lock);
+	mutex_init(&vop->vop_lock);
 
 	mutex_init(&vop->vsync_mutex);
 
@@ -2514,12 +3231,51 @@ static int vop_bind(struct device *dev, struct device *master, void *data)
 		return ret;
 
 	pm_runtime_enable(&pdev->dev);
+
+	of_rockchip_drm_sub_backlight_register(dev, &vop->crtc,
+					       &rockchip_sub_backlight_ops);
+
+	mutex_lock(&register_devfreq_lock);
+
+	for (i = 0; i < ARRAY_SIZE(dmc_vop); i++) {
+		if (dmc_vop[i])
+			continue;
+		if (devfreq_vop) {
+			vop->dmc_nb.notifier_call = dmc_notifier_call;
+			devfreq_register_notifier(devfreq_vop,
+						  &vop->dmc_nb,
+						  DEVFREQ_TRANSITION_NOTIFIER);
+		}
+		dmc_vop[i] = vop;
+		break;
+	}
+
+	mutex_unlock(&register_devfreq_lock);
+
 	return 0;
 }
 
 static void vop_unbind(struct device *dev, struct device *master, void *data)
 {
 	struct vop *vop = dev_get_drvdata(dev);
+	int i;
+
+	mutex_lock(&register_devfreq_lock);
+
+	for (i = 0; i < ARRAY_SIZE(dmc_vop); i++) {
+		if (dmc_vop[i] != vop)
+			continue;
+		dmc_vop[i] = NULL;
+
+		if (!devfreq_vop)
+			break;
+		devfreq_unregister_notifier(devfreq_vop,
+					    &vop->dmc_nb,
+					    DEVFREQ_TRANSITION_NOTIFIER);
+		break;
+	}
+
+	mutex_unlock(&register_devfreq_lock);
 
 	pm_runtime_disable(dev);
 	vop_destroy_crtc(vop);

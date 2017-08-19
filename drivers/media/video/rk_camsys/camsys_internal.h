@@ -155,8 +155,25 @@
 	1) clock clk_vio0_noc would cause mipi lcdc no display on 3368h, remove it.
 *v0.0x21.0xb:
 	1) some log is boring, so set print level more high.
+*v0.0x21.0xc:
+	1) support rk3288.
+*v0.0x21.0xd:
+	1) modify mipiphy_hsfreqrange for 3368.
+*v0.0x21.0xe
+	1) correct mipiphy_hsfreqrange of 3368.
+	2) add csi-phy timing setting for 3368.
+*v0.0x21.0xf:
+	1) add reference count for marvin.
+*v0.0x22.0:
+	1) delete node in irqpool list when thread disconnect.
+*v0.0x22.1:
+	1) gpio0_D is unavailable on rk3288 with current pinctrl driver.
+*v0.0x22.2:
+	1) modify the condition of DRM iommu, which makes code  more readable
+	by using of_parse_phandle to check whether the "iommus" phandle exists
+	in the isp device node.
 */
-#define CAMSYS_DRIVER_VERSION                   KERNEL_VERSION(0, 0x21, 0xb)
+#define CAMSYS_DRIVER_VERSION                   KERNEL_VERSION(0, 0x22, 2)
 
 #define CAMSYS_PLATFORM_DRV_NAME                "RockChip-CamSys"
 #define CAMSYS_PLATFORM_MARVIN_NAME             "Platform_MarvinDev"
@@ -316,7 +333,7 @@ typedef struct camsys_dev_s {
 	unsigned long         rk_grf_base;
 	unsigned long         rk_cru_base;
 	unsigned long         rk_isp_base;
-
+	atomic_t              refcount;
 	struct iommu_domain *domain;
 	camsys_dma_buf_t dma_buf[CAMSYS_DMA_BUF_MAX_NUM];
 	int dma_buf_cnt;

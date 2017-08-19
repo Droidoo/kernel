@@ -50,21 +50,27 @@
 	};
 
 	edp_panel: edp-panel {
-		compatible ="lg,lp079qx1-sp0v", "simple-panel";
-		enable-gpios = <&gpio7 4 GPIO_ACTIVE_HIGH>;
-		pinctrl-0 = <&lcd_cs>;
 		status = "disabled";
 
 		ports {
-			panel_in: port {
-				panel_in_edp: endpoint {
-					remote-endpoint = <&edp_out_panel>;
-				};
+			panel_in_edp: endpoint {
+				remote-endpoint = <&edp_out_panel>;
 			};
 		};
 	};
 
-	sound {
+	lvds_panel: lvds-panel {
+		status = "disabled";
+		pinctrl-0 = <&lcd_cs>;
+		ports {
+			panel_in_lvds: endpoint {
+				remote-endpoint = <&lvds_out_panel>;
+			};
+		};
+	};
+
+	sound: sound {
+		status = "disabled";
 		compatible = "simple-audio-card";
 		simple-audio-card,format = "i2s";
 		simple-audio-card,name = "rockchip,rt5640-codec";
@@ -100,13 +106,6 @@
 				sound-dai = <&hdmi>;
 			};
 		};
-	};
-
-	lvds_panel: lvds_panel {
-		compatible ="auo,b101ew05","simple-panel";
-		enable-gpios = <&gpio7 4 GPIO_ACTIVE_HIGH>;
-		pinctrl-0 = <&lcd_cs>;
-		status = "disabled";
 	};
 
 	ext_gmac: external-gmac-clock {
@@ -215,6 +214,9 @@
 	num-slots = <1>;
 	pinctrl-names = "default";
 	pinctrl-0 = <&emmc_clk &emmc_cmd &emmc_pwr &emmc_bus8>;
+	max-frequency = <100000000>;
+	mmc-hs200-1_8v;
+	mmc-ddr-1_8v;
 	status = "okay";
 };
 
@@ -224,7 +226,7 @@
 	clock_in_out = "input";
 	snps,reset-gpio = <&gpio4 7 0>;
 	snps,reset-active-low;
-	snps,reset-delays-us = <0 10000 1000000>;
+	snps,reset-delays-us = <0 10000 50000>;
 	assigned-clocks = <&cru SCLK_MAC>;
 	assigned-clock-parents = <&ext_gmac>;
 	pinctrl-names = "default";
@@ -240,13 +242,6 @@
 	#size-cells = <0>;
 	#sound-dai-cells = <0>;
 	status = "okay";
-
-	/* Don't use vopl for HDMI */
-	ports {
-		hdmi_in: port {
-			/delete-node/ endpoint@1;
-		};
-	};
 };
 
 &saradc {
@@ -274,20 +269,11 @@
 	supports-sd;
 };
 
-&edp_phy {
-	status = "okay";
-};
-
 &edp {
 	force-hpd;
-	status = "okay";
+	status = "disabled";
 
 	ports {
-		/* Don't use vopb for eDP */
-		edp_in: port@0 {
-			/delete-node/ endpoint@0;
-		};
-
 		edp_out: port@1 {
 			reg = <1>;
 			#address-cells = <1>;
@@ -322,8 +308,13 @@
 	};
 };
 
+&i2c3 {
+	status = "okay";
+};
+
 &i2c4 {
 	status = "okay";
+	clock-frequency = <400000>;
 
 	gsl3673@40 {
 		compatible = "GSL,GSL3673";
@@ -353,6 +344,14 @@
 };
 
 &pwm0 {
+	status = "okay";
+};
+
+&isp {
+	status = "okay";
+};
+
+&isp_mmu {
 	status = "okay";
 };
 
@@ -387,7 +386,7 @@
 };
 
 &uart2 {
-	status = "okay";
+	status = "disabled";
 };
 
 &vpu_service {
@@ -409,6 +408,10 @@
 	status = "okay";
 };
 
+&usb_host0_ohci {
+	status = "okay";
+};
+
 &usb_host1 {
 	status = "okay";
 };
@@ -418,20 +421,23 @@
 };
 
 &lvds {
-	rockchip,data-mapping = "jeida";
-	rockchip,data-width = <24>;
-	rockchip,output = "lvds";
-	rockchip,panel = <&lvds_panel>;
 	status = "disabled";
+	ports {
+		lvds_out: port@1 {
+			reg = <1>;
+			#address-cells = <1>;
+			#size-cells = <0>;
+
+			lvds_out_panel: endpoint@0 {
+				reg = <0>;
+				remote-endpoint = <&panel_in_lvds>;
+			};
+		};
+	};
 };
 
 &vopb {
 	status = "okay";
-
-	/* Don't use vopb for eDP, save it for HDMI */
-	vopb_out: port {
-		/delete-node/ endpoint@1;
-	};
 };
 
 &vopb_mmu {
@@ -440,11 +446,6 @@
 
 &vopl {
 	status = "okay";
-
-	/* Don't use vopb for HDMI, save it for eDP */
-	vopl_out: port {
-		/delete-node/ endpoint@0;
-	};
 };
 
 &vopl_mmu {

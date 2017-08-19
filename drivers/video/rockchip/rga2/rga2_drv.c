@@ -919,6 +919,7 @@ static int rga2_blit_async(rga2_session *session, struct rga2_req *req)
 static int rga2_blit_sync(rga2_session *session, struct rga2_req *req)
 {
 	struct rga2_req req_bak;
+	int restore = 0;
 	int try = 10;
 	int ret = -1;
 	int ret_timeout = 0;
@@ -969,11 +970,30 @@ retry:
 #endif
 	if (ret == -ETIMEDOUT && try--) {
 		memcpy(req, &req_bak, sizeof(req_bak));
+		/*
+		 * if rga work timeout with scaling, need do a non-scale work
+		 * first, restore hardware status, then do actually work.
+		 */
+		if (req->src.act_w != req->dst.act_w ||
+		    req->src.act_h != req->dst.act_h) {
+			req->src.act_w = MIN(320, MIN(req->src.act_w,
+						      req->dst.act_w));
+			req->src.act_h = MIN(240, MIN(req->src.act_h,
+						      req->dst.act_h));
+			req->dst.act_w = req->src.act_w;
+			req->dst.act_h = req->src.act_h;
+			restore = 1;
+		}
+		goto retry;
+	}
+	if (!ret && restore) {
+		memcpy(req, &req_bak, sizeof(req_bak));
+		restore = 0;
 		goto retry;
 	}
 
 	return ret;
-	}
+}
 
 static long rga_ioctl(struct file *file, uint32_t cmd, unsigned long arg)
 {
@@ -1493,11 +1513,17 @@ static int __init rga2_init(void)
 {
 	int ret;
 	uint32_t *buf_p;
+	uint32_t *buf;
 
 	/* malloc pre scale mid buf mmu table */
 	buf_p = kmalloc(1024*256, GFP_KERNEL);
 	rga2_mmu_buf.buf_virtual = buf_p;
-	rga2_mmu_buf.buf = (uint32_t *)virt_to_phys((void *)((unsigned long)buf_p));
+#if (defined(CONFIG_ARM) && defined(CONFIG_ARM_LPAE))
+	buf = (uint32_t *)(uint32_t)virt_to_phys((void *)((unsigned long)buf_p));
+#else
+	buf = (uint32_t *)virt_to_phys((void *)((unsigned long)buf_p));
+#endif
+	rga2_mmu_buf.buf = buf;
 	rga2_mmu_buf.front = 0;
 	rga2_mmu_buf.back = 64*1024;
 	rga2_mmu_buf.size = 64*1024;
@@ -1688,7 +1714,7 @@ void rga2_test_0(void)
 }
 #endif
 
-module_init(rga2_init);
+late_initcall(rga2_init);
 module_exit(rga2_exit);
 
 /* Module information */

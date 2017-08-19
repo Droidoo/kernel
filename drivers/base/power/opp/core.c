@@ -259,9 +259,6 @@ unsigned long dev_pm_opp_get_max_volt_latency(struct device *dev)
 	reg = opp_table->regulator;
 	if (IS_ERR(reg)) {
 		/* Regulator may not be required for device */
-		if (reg)
-			dev_err(dev, "%s: Invalid regulator (%ld)\n", __func__,
-				PTR_ERR(reg));
 		rcu_read_unlock();
 		return 0;
 	}
@@ -956,12 +953,6 @@ static void _remove_opp_table(struct opp_table *opp_table)
 	struct opp_device *opp_dev;
 
 	if (!list_empty(&opp_table->opp_list))
-		return;
-
-	if (opp_table->supported_hw)
-		return;
-
-	if (opp_table->prop_name)
 		return;
 
 	if (!IS_ERR(opp_table->regulator))
@@ -1883,94 +1874,6 @@ unlock:
 	return r;
 }
 
-/*
- * dev_pm_opp_adjust_voltage() - helper to change the voltage of an OPP
- * @dev:		device for which we do this operation
- * @freq:		OPP frequency to adjust voltage of
- * @u_volt:		new OPP voltage
- *
- * Change the voltage of an OPP with an RCU operation.
- *
- * Return: -EINVAL for bad pointers, -ENOMEM if no memory available for the
- * copy operation, returns 0 if no modifcation was done OR modification was
- * successful.
- *
- * Locking: The internal device_opp and opp structures are RCU protected.
- * Hence this function internally uses RCU updater strategy with mutex locks to
- * keep the integrity of the internal data structures. Callers should ensure
- * that this function is *NOT* called under RCU protection or in contexts where
- * mutex locking or synchronize_rcu() blocking calls cannot be used.
- */
-int dev_pm_opp_adjust_voltage(struct device *dev, unsigned long freq,
-			      unsigned long u_volt)
-{
-	struct opp_table *opp_table;
-	struct dev_pm_opp *new_opp, *tmp_opp, *opp = ERR_PTR(-ENODEV);
-	int r = 0;
-
-	/* keep the node allocated */
-	new_opp = kmalloc(sizeof(*new_opp), GFP_KERNEL);
-	if (!new_opp)
-		return -ENOMEM;
-
-	mutex_lock(&opp_table_lock);
-
-	/* Find the opp_table */
-	opp_table = _find_opp_table(dev);
-	if (IS_ERR(opp_table)) {
-		r = PTR_ERR(opp_table);
-		dev_warn(dev, "%s: Device OPP not found (%d)\n", __func__, r);
-		goto unlock;
-	}
-
-	/* Do we have the frequency? */
-	list_for_each_entry(tmp_opp, &opp_table->opp_list, node) {
-		if (tmp_opp->rate == freq) {
-			opp = tmp_opp;
-			break;
-		}
-	}
-	if (IS_ERR(opp)) {
-		r = PTR_ERR(opp);
-		goto unlock;
-	}
-
-	/* Is update really needed? */
-	if (opp->u_volt == u_volt)
-		goto unlock;
-	/* copy the old data over */
-	*new_opp = *opp;
-
-	/* plug in new node */
-	new_opp->u_volt = u_volt;
-
-	if (new_opp->u_volt_min > u_volt)
-		new_opp->u_volt_min = u_volt;
-	if (new_opp->u_volt_max < u_volt)
-		new_opp->u_volt_max = u_volt;
-
-	_opp_remove(opp_table, opp, false);
-	r = _opp_add(dev, new_opp, opp_table);
-	if (r) {
-		dev_err(dev, "Failed to add new_opp (u_volt=%lu)\n", u_volt);
-		_opp_add(dev, opp, opp_table);
-		goto unlock;
-	}
-
-	mutex_unlock(&opp_table_lock);
-
-	/* Notify the change of the OPP */
-	srcu_notifier_call_chain(&opp_table->srcu_head,
-				 OPP_EVENT_ADJUST_VOLTAGE, new_opp);
-
-	return 0;
-
-unlock:
-	mutex_unlock(&opp_table_lock);
-	kfree(new_opp);
-	return r;
-}
-
 /**
  * dev_pm_opp_enable() - Enable a specific OPP
  * @dev:	device for which we do this operation
@@ -2252,4 +2155,64 @@ int dev_pm_opp_of_add_table(struct device *dev)
 	return ret;
 }
 EXPORT_SYMBOL_GPL(dev_pm_opp_of_add_table);
+#endif
+
+#ifdef CONFIG_DEBUG_FS
+#include <linux/debugfs.h>
+
+static int opp_summary_show(struct seq_file *s, void *data)
+{
+	struct list_head *lists = (struct list_head *)s->private;
+	struct opp_table *opp_table;
+	struct dev_pm_opp *opp;
+
+	mutex_lock(&opp_table_lock);
+
+	seq_puts(s, " device                rate(Hz)    target(uV)    min(uV)    max(uV)\n");
+	seq_puts(s, "-------------------------------------------------------------------\n");
+
+	list_for_each_entry_rcu(opp_table, lists, node) {
+		seq_printf(s, " %s\n", opp_table->dentry_name);
+		list_for_each_entry(opp, &opp_table->opp_list, node) {
+			seq_printf(s, "%31lu %12lu %11lu %11lu\n",
+				   opp->rate,
+				   opp->u_volt,
+				   opp->u_volt_min,
+				   opp->u_volt_max);
+		}
+	}
+
+	mutex_unlock(&opp_table_lock);
+
+	return 0;
+}
+
+static int opp_summary_open(struct inode *inode, struct file *file)
+{
+	return single_open(file, opp_summary_show, inode->i_private);
+}
+
+static const struct file_operations opp_summary_fops = {
+	.open		= opp_summary_open,
+	.read		= seq_read,
+	.llseek		= seq_lseek,
+	.release	= single_release,
+};
+
+static int __init opp_debug_init(void)
+{
+	struct dentry *parent, *d;
+
+	parent = debugfs_lookup("opp", NULL);
+	if (!parent)
+		return -ENOMEM;
+
+	d = debugfs_create_file("opp_summary", 0444, parent, &opp_tables,
+				&opp_summary_fops);
+	if (!d)
+		return -ENOMEM;
+
+	return 0;
+}
+late_initcall(opp_debug_init);
 #endif
