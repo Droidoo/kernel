@@ -1049,7 +1049,7 @@ void rk_get_eth_addr_vendor(void *priv, unsigned char *addr)
 			dev_err(dev, "%s: rk_vendor_write eth mac address failed (%d)",
 					__func__, ret);
 	} else {
-		dev_err(dev, "%s: rk_vendor_read eth mac address: %02x:%02x:%02x:%02x:%02x:%02x",
+		dev_dbg(dev, "%s: rk_vendor_read eth mac address: %02x:%02x:%02x:%02x:%02x:%02x",
 					__func__, addr[0], addr[1], addr[2],
 					addr[3], addr[4], addr[5]);
 	}

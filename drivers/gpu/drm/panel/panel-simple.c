@@ -686,15 +686,15 @@ static const struct panel_desc auo_b101ean01 = {
 };
 
 static const struct drm_display_mode auo_b101ew05_mode = {
-	.clock = 71000,
+	.clock = 78000,
 	.hdisplay = 1280,
 	.hsync_start = 1280 + 18,
-	.hsync_end = 1280 + 18 + 10,
-	.htotal = 1280 + 18 + 10 + 100,
+	.hsync_end = 1280 + 18 + 100,
+	.htotal = 1280 + 18 + 100 + 10,
 	.vdisplay = 800,
 	.vsync_start = 800 + 6,
-	.vsync_end = 800 + 6 + 2,
-	.vtotal = 800 + 6 + 2 + 8,
+	.vsync_end = 800 + 6 + 8,
+	.vtotal = 800 + 6 + 8 + 2,
 	.vrefresh = 60,
 };
 
@@ -1656,6 +1656,9 @@ static const struct of_device_id platform_of_match[] = {
 	}, {
 		.compatible = "lg,lp079qx1-sp0v",
 		.data = &lg_lp079qx1_sp0v,
+	}, {
+		.compatible = "sharp,lcd-f402",
+		.data = &sharp_lcd_f402,
 	}, {
 		.compatible = "lg,lp097qx1-spa1",
 		.data = &lg_lp097qx1_spa1,

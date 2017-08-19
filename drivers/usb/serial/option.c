@@ -51,6 +51,8 @@ static void option_release(struct usb_serial *serial);
 static void option_instat_callback(struct urb *urb);
 
 /* Vendor and product IDs */
+#define SIGNAL_VENDOR_ID 0x05c6
+#define SIGNAL_PRODUCT_ID 0x9025
 #define OPTION_VENDOR_ID			0x0AF0
 #define OPTION_PRODUCT_COLT			0x5000
 #define OPTION_PRODUCT_RICOLA			0x6000
@@ -662,6 +664,7 @@ static const struct option_blacklist_info cinterion_rmnet2_blacklist = {
 };
 
 static const struct usb_device_id option_ids[] = {
+	{ USB_DEVICE(SIGNAL_VENDOR_ID, SIGNAL_PRODUCT_ID) },
 	{ USB_DEVICE(OPTION_VENDOR_ID, OPTION_PRODUCT_COLT) },
 	{ USB_DEVICE(OPTION_VENDOR_ID, OPTION_PRODUCT_RICOLA) },
 	{ USB_DEVICE(OPTION_VENDOR_ID, OPTION_PRODUCT_RICOLA_LIGHT) },

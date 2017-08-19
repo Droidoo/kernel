@@ -53,7 +53,7 @@
 	compatible = "rockchip,rk3399-firefly-linux", "rockchip,rk3399";
 
 	backlight: backlight {
-		status = "disabled";
+		status = "okay";
 		compatible = "pwm-backlight";
 		pwms = <&pwm0 0 25000 0>;
 		brightness-levels = <
@@ -106,7 +106,6 @@
 	};
 
 	edp_panel: edp-panel {
-		status = "disabled";
 		compatible = "sharp,lcd-f402", "panel-simple";
 		backlight = <&backlight>;
 		power-supply = <&vcc_lcd>;
@@ -246,17 +245,6 @@
 		pinctrl-0 = <&pcie_drv>;
 		regulator-name = "vcc3v3_pcie";
 	};
-
-	vcc3v3_3g: vcc3v3-3g-regulator {
-		compatible = "regulator-fixed";
-		enable-active-high;
-		regulator-always-on;
-		regulator-boot-on;
-		gpio = <&gpio0 2 GPIO_ACTIVE_HIGH>;
-		pinctrl-names = "default";
-		pinctrl-0 = <&pcie_3g_drv>;
-		regulator-name = "vcc3v3_3g";
-    };
 
 	vcc3v3_sys: vcc3v3-sys {
 		compatible = "regulator-fixed";
@@ -402,7 +390,7 @@
 };
 
 &edp {
-	status = "disabled";
+	status = "okay";
 
 	ports {
 		edp_out: port@1 {
@@ -434,7 +422,7 @@
 	pinctrl-names = "default";
 	pinctrl-0 = <&rgmii_pins>;
 	tx_delay = <0x28>;
-	rx_delay = <0x1B>;
+	rx_delay = <0x11>;
 	status = "okay";
 };
 
@@ -447,6 +435,7 @@
 	#address-cells = <1>;
 	#size-cells = <0>;
 	#sound-dai-cells = <0>;
+	ddc-i2c-bus = <&i2c3>;
 	status = "okay";
 };
 
@@ -720,17 +709,16 @@
 	};
 
     gsl3680: gsl3680@41 {
-			status = "disabled";
-			compatible = "gslX680-pad";
-			reg = <0x41>;
-			screen_max_x = <1536>;
-			screen_max_y = <2048>;
-			touch-gpio = <&gpio1 20 IRQ_TYPE_LEVEL_LOW>;
-			reset-gpio = <&gpio0 12 GPIO_ACTIVE_HIGH>;
+	      status = "okay";
+              compatible = "gslX680-pad";
+              reg = <0x41>;
+              screen_max_x = <1536>;
+              screen_max_y = <2048>;
+              touch-gpio = <&gpio1 20 IRQ_TYPE_LEVEL_LOW>;
+              reset-gpio = <&gpio0 12 GPIO_ACTIVE_HIGH>;
       };
 
 	mpu6050:mpu@68{
-			status = "disabled";
             compatible = "invensense,mpu6050";
             reg = <0x68>;
             mpu-int_config = <0x10>;
@@ -812,9 +800,9 @@
 		pcie_drv: pcie-drv {
 			rockchip,pins =
 				<1 17 RK_FUNC_GPIO &pcfg_pull_none>;
-		};
-		pcie_3g_drv: pcie-3g-drv {
-		rockchip,pins =
+			};
+			pcie_3g_drv: pcie-3g-drv {
+			rockchip,pins =
 				<0 2 RK_FUNC_GPIO &pcfg_pull_up>;
 		};
 
@@ -907,22 +895,12 @@
 };
 
 &route_edp {
-	status = "disabled";
+	status = "okay";
 };
 
 &route_hdmi {
 	status = "okay";
 	logo,mode = "center";
-};
-
-&cdn_dp {
-        status = "okay";
-        extcon = <&fusb0>;
-        phys = <&tcphy0_dp>;
-};
-
-&dp_in_vopb {
-        status = "disabled";
 };
 
 &saradc {
