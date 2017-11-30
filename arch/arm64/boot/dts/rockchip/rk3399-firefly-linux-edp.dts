@@ -737,6 +737,8 @@
 	rockchip,i2s-broken-burst-len;
 	rockchip,playback-channels = <8>;
 	rockchip,capture-channels = <8>;
+	assigned-clocks = <&cru SCLK_I2S0_DIV>, <&cru SCLK_I2S_8CH>;
+	assigned-clock-parents = <&cru PLL_GPLL>, <&cru SCLK_I2S0_8CH>;
 	#sound-dai-cells = <0>;
 };
 
@@ -745,6 +747,8 @@
 	rockchip,i2s-broken-burst-len;
 	rockchip,playback-channels = <2>;
 	rockchip,capture-channels = <2>;
+	assigned-clocks = <&cru SCLK_I2S1_DIV>, <&cru SCLK_I2S_8CH>;
+	assigned-clock-parents = <&cru PLL_GPLL>, <&cru SCLK_I2S1_8CH>;
 	#sound-dai-cells = <0>;
 };
 

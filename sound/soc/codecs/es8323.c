@@ -40,7 +40,7 @@
 #define ES8323_CODEC_SET_SPK	1
 #define ES8323_CODEC_SET_HP	2
 
-#define es8323_DEF_VOL	0x1b
+#define es8323_DEF_VOL	0x20
 
 static int es8323_set_bias_level(struct snd_soc_codec *codec,
 				 enum snd_soc_bias_level level);

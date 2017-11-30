@@ -498,8 +498,10 @@
 		reg = <0x1b>;
 		interrupt-parent = <&gpio1>;
 		interrupts = <21 IRQ_TYPE_LEVEL_LOW>;
+		pmic,stby-gpio = <&gpio1 24 GPIO_ACTIVE_LOW>;
+		pmic,hold-gpio = <&gpio1 13 GPIO_ACTIVE_HIGH>;
 		pinctrl-names = "default";
-		pinctrl-0 = <&pmic_int_l &pmic_dvs2>;
+		pinctrl-0 = <&pmic_int_l &pmic_dvs2 &pmic_stby &pmic_hold>;
 		rockchip,system-power-controller;
 		wakeup-source;
 		#clock-cells = <1>;
@@ -749,6 +751,8 @@
 	rockchip,i2s-broken-burst-len;
 	rockchip,playback-channels = <8>;
 	rockchip,capture-channels = <8>;
+	assigned-clocks = <&cru SCLK_I2S0_DIV>, <&cru SCLK_I2S_8CH>;
+	assigned-clock-parents = <&cru PLL_GPLL>, <&cru SCLK_I2S0_8CH>;
 	#sound-dai-cells = <0>;
 };
 
@@ -757,6 +761,8 @@
 	rockchip,i2s-broken-burst-len;
 	rockchip,playback-channels = <2>;
 	rockchip,capture-channels = <2>;
+	assigned-clocks = <&cru SCLK_I2S1_DIV>, <&cru SCLK_I2S_8CH>;
+	assigned-clock-parents = <&cru PLL_GPLL>, <&cru SCLK_I2S1_8CH>;
 	#sound-dai-cells = <0>;
 };
 
@@ -830,6 +836,16 @@
 			rockchip,pins =
 			<1 14 RK_FUNC_GPIO &pcfg_pull_down>;
 		};
+		pmic_stby: pmic-stby {
+			rockchip,pins =
+				<1 24 RK_FUNC_GPIO &pcfg_pull_up>;
+		};
+
+		pmic_hold: pmic-hold{
+			rockchip,pins =
+				<1 13 RK_FUNC_GPIO &pcfg_pull_up>;
+		};
+
 	};
 
 	sdio-pwrseq {
@@ -916,7 +932,7 @@
 };
 
 &cdn_dp {
-        status = "okay";
+        status = "disabled";
         extcon = <&fusb0>;
         phys = <&tcphy0_dp>;
 };

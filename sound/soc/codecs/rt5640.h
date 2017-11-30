@@ -2091,7 +2091,8 @@ struct rt5640_priv {
 	struct rt5640_platform_data pdata;
 	struct regmap *regmap;
 	struct clk *mclk;
-
+	struct work_struct work;
+	struct workqueue_struct *wq;
 	int sysclk;
 	int sysclk_src;
 	int lrck[RT5640_AIFS];
@@ -2110,6 +2111,10 @@ struct rt5640_priv {
 	bool hp_insert;
 	int hp_con_gpio;
 	bool hp_con_gpio_active_high;
+	struct delayed_work init_delayed_work;
+	struct delayed_work aux_det_work;
+	int aux_det_gpio;
+	int aux_det_irq;
 	struct snd_soc_jack hp_jack;
 };
 

@@ -1095,10 +1095,6 @@ static void rockchip_dsi_grf_config(struct dw_mipi_dsi *dsi, int vop_id)
 
 		regmap_write(dsi->grf_regmap, pdata->grf_switch_reg, val);
 
-		if (pdata->grf_dsi0_mode_reg)
-			regmap_write(dsi->grf_regmap, pdata->grf_dsi0_mode_reg,
-				     pdata->grf_dsi0_mode);
-
 	}
 
 	dev_info(dsi->dev, "vop %s output to dsi0\n", (vop_id) ? "LIT" : "BIG");
@@ -1139,6 +1135,8 @@ static void rockchip_dsi_pre_init(struct dw_mipi_dsi *dsi)
 
 static void rockchip_dsi_host_init(struct dw_mipi_dsi *dsi)
 {
+	const struct dw_mipi_dsi_plat_data *pdata = dsi->pdata;
+
 	dw_mipi_dsi_init(dsi);
 	dw_mipi_dsi_dpi_config(dsi, &dsi->mode);
 	dw_mipi_dsi_packet_handler_config(dsi);
@@ -1151,6 +1149,12 @@ static void rockchip_dsi_host_init(struct dw_mipi_dsi *dsi)
 	dw_mipi_dsi_dphy_timing_config(dsi);
 	dw_mipi_dsi_dphy_interface_config(dsi);
 	dw_mipi_dsi_clear_err(dsi);
+
+		if (pdata->grf_dsi0_mode_reg)
+			regmap_write(dsi->grf_regmap, pdata->grf_dsi0_mode_reg,
+				     pdata->grf_dsi0_mode);
+
+
 }
 
 static void rockchip_dsi_init(struct dw_mipi_dsi *dsi)
@@ -1180,7 +1184,6 @@ static void dw_mipi_dsi_encoder_enable(struct drm_encoder *encoder)
 
 	vop_id = drm_of_encoder_active_endpoint_id(dsi->dev->of_node, encoder);
 
-	rockchip_dsi_grf_config(dsi, vop_id);
 	rockchip_dsi_init(dsi);
 
 	if (dsi->panel)
@@ -1190,6 +1193,8 @@ static void dw_mipi_dsi_encoder_enable(struct drm_encoder *encoder)
 
 	if (dsi->panel)
 		drm_panel_enable(dsi->panel);
+
+	rockchip_dsi_grf_config(dsi, vop_id);
 }
 
 static int

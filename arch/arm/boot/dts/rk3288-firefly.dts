@@ -67,5 +67,6 @@
 };
 
 &pwm1 {
-	status = "okay";
+	status = "disabled";
+	//status = "okay";
 };

@@ -53,9 +53,9 @@
 	compatible = "rockchip,rk3399-firefly-mini-linux", "rockchip,rk3399";
 
 	backlight: backlight {
-		status = "disabled";
+		status = "okay";
 		compatible = "pwm-backlight";
-		pwms = <&pwm0 0 25000 0>;
+		pwms = <&pwm1 0 25000 0>;
 		brightness-levels = <
 			  0   1   2   3   4   5   6   7
 			  8   9  10  11  12  13  14  15
@@ -105,7 +105,7 @@
 		#sound-dai-cells = <0>;
 	};
 
-	edp_panel: edp-panel {  
+	edp_panel: edp-panel {
 		status = "disabled";
 		compatible = "sharp,lcd-f402", "panel-simple";
 		backlight = <&backlight>;
@@ -121,7 +121,7 @@
 		};
 	};
 
-	fiq_debugger: fiq-debugger {     
+	fiq_debugger: fiq-debugger {
 		compatible = "rockchip,fiq-debugger";
 		rockchip,serial-id = <2>;
 		rockchip,signal-irq = <182>;
@@ -178,10 +178,10 @@
 		simple-audio-card,format = "i2s";
 		simple-audio-card,name = "rockchip,es8323-codec";
 		simple-audio-card,mclk-fs = <256>;
-		simple-audio-card,widgets = 
+		simple-audio-card,widgets =
 				"Microphone","Mic Jack",
 				"Headphone","Headphone Jack";
-		simple-audio-card,routing = 
+		simple-audio-card,routing =
 				"Mic Jack","MICBIAS1",
 				"IN1P","Mic Jack",
 				"Headphone Jack","HPOL",
@@ -192,7 +192,6 @@
 		simple-audio-card,codec {
 				sound-dai = <&es8323>;
 		};
-
 	};
 
 	hdmi_sound: hdmi-sound {
@@ -219,7 +218,6 @@
 		simple-audio-card,cpu {
 			sound-dai = <&i2s2>;
 		};
-
 		simple-audio-card,codec {
 			sound-dai = <&hdmi>;
 		};
@@ -358,26 +356,86 @@
 		status = "okay";
 	};
 
-    leds {
-       compatible = "gpio-leds";
-       power {
-           label = "firefly:blue:power";
-           linux,default-trigger = "ir-power-click";
-           default-state = "on";
-           gpios = <&gpio2 27 GPIO_ACTIVE_HIGH>;
-           pinctrl-names = "default";
-           pinctrl-0 = <&led_power>;
-       };
-       user {
-           label = "firefly:yellow:user";
-           linux,default-trigger = "ir-user-click";
-           default-state = "off";
-           gpios = <&gpio0 13 GPIO_ACTIVE_HIGH>;
-           pinctrl-names = "default";
-           pinctrl-0 = <&led_user>;
+	leds {
+		compatible = "gpio-leds";
+		power {
+			label = "firefly:blue:power";
+			linux,default-trigger = "ir-power-click";
+			default-state = "on";
+			gpios = <&gpio2 27 GPIO_ACTIVE_HIGH>;
+			pinctrl-names = "default";
+			pinctrl-0 = <&led_power>;
+		};
+		user {
+			label = "firefly:yellow:user";
+			linux,default-trigger = "ir-user-click";
+			default-state = "off";
+			gpios = <&gpio0 13 GPIO_ACTIVE_HIGH>;
+			pinctrl-names = "default";
+			pinctrl-0 = <&led_user>;
        };
    };
 };
+
+&dsi {
+	status = "okay";
+	dsi_panel: dsi_panel {
+		compatible ="simple-panel-dsi";
+		reg = <0>;
+		//enable-gpios = <&gpio1 4 GPIO_ACTIVE_HIGH>;
+		//reset-gpios = <&gpio4 29 GPIO_ACTIVE_LOW>;
+		dsi,flags = <(MIPI_DSI_MODE_VIDEO | MIPI_DSI_MODE_VIDEO_BURST)>;
+		dsi,format = <MIPI_DSI_FMT_RGB888>;
+		dsi,lanes = <4>;
+		delay,prepare = <10>;
+		status = "okay";
+
+		/*
+		dsi,channel = <0>;
+
+        delay,enable = <10>;
+        delay,power = <10>;
+        delay,reset = <20>;
+        delay,prepare = <10>;
+
+        delay,unpreapre = <0>;
+        delay,unreset = <0>;
+        delay,unpower = <0>;
+        delay,disable = <0>;
+		
+        size,width = <120>;
+        size,height = <170>;
+		*/
+
+		panel-init-sequence = [
+			05 20 01 29
+			05 96 01 11
+		];
+		panel-exit-sequence = [
+				05 05 01 28
+				05 78 01 10
+		];
+
+		disp_timings: display-timings {
+			native-mode = <&timing0>;
+			timing0: timing0 {
+			   clock-frequency = <64000000>;
+			   hactive = <768>;
+			   vactive = <1024>;
+			   hsync-len = <5>;   //20, 50
+			   hback-porch = <25>; //50, 56
+			   hfront-porch = <150>;//50, 30
+			   vsync-len = <1>;
+			   vback-porch = <15>;
+			   vfront-porch = <100>;
+			   hsync-active = <0>;
+			   vsync-active = <0>;
+			   de-active = <0>;
+			   pixelclk-active = <0>;
+			};
+		};
+	};
+};	
 
 &cpu_l0 {
 	cpu-supply = <&vdd_cpu_l>;
@@ -407,7 +465,7 @@
 	status = "okay";
 };
 
-&edp {  
+&edp {
 	status = "disabled";
 
 	ports {
@@ -718,7 +776,7 @@
 	};
 };
 
-&i2c3 { 
+&i2c3 {
 	status = "okay";
 	i2c-scl-rising-time-ns = <450>;
 	i2c-scl-falling-time-ns = <15>;
@@ -739,29 +797,29 @@
 		status = "disabled";
 	};
 
-    gsl3680: gsl3680@41 {
-			status = "disabled";
-			compatible = "gslX680-pad";
-			reg = <0x41>;
-			screen_max_x = <1536>;
-			screen_max_y = <2048>;
-			touch-gpio = <&gpio1 20 IRQ_TYPE_LEVEL_LOW>;
-			reset-gpio = <&gpio0 12 GPIO_ACTIVE_HIGH>;
-      };
+	gsl3680: gsl3680@40 {
+		status = "okay";
+		compatible = "gslX680";
+		reg = <0x40>;
+		screen_max_x = <1536>;
+		screen_max_y = <2048>;
+		touch-gpio = <&gpio4 28 IRQ_TYPE_LEVEL_LOW>;
+		reset-gpio = <&gpio4 21 GPIO_ACTIVE_HIGH>;
+	};
 
-   	mpu6050:mpu@68{
-			status = "disabled";
-            compatible = "invensense,mpu6050";
-            reg = <0x68>;
-            mpu-int_config = <0x10>;
-            mpu-level_shifter = <0>;
-            mpu-orientation = <0 1 0 1 0 0 0 0 1>;
-            orientation-x= <1>;
-            orientation-y= <1>;
-            orientation-z= <1>;
-            irq-gpio = <&gpio1 4 IRQ_TYPE_LEVEL_LOW>;
-            mpu-debug = <1>;
-        };
+	mpu6050: mpu@68 {
+		status = "disabled";
+		compatible = "invensense,mpu6050";
+		reg = <0x68>;
+		mpu-int_config = <0x10>;
+		mpu-level_shifter = <0>;
+		mpu-orientation = <0 1 0 1 0 0 0 0 1>;
+		orientation-x= <1>;
+		orientation-y= <1>;
+		orientation-z= <1>;
+		irq-gpio = <&gpio1 4 IRQ_TYPE_LEVEL_LOW>;
+		mpu-debug = <1>;
+	};
 };
 
 &i2s0 {
@@ -783,7 +841,6 @@
 };
 
 &i2s2 {
-
 	#sound-dai-cells = <0>;
 	status = "okay";
 };
@@ -815,7 +872,7 @@
 };
 
 &pinctrl {
-	buttons {   
+	buttons {
 		pwrbtn: pwrbtn {
 			rockchip,pins = <0 5 RK_FUNC_GPIO &pcfg_pull_up>;
 		};
@@ -831,7 +888,7 @@
 		};
 	};
 
-	pcie {  
+	pcie {
 		pcie_drv: pcie-drv {
 			rockchip,pins =
 				<1 17 RK_FUNC_GPIO &pcfg_pull_none>;
@@ -840,7 +897,6 @@
 			rockchip,pins =
 				<0 2 RK_FUNC_GPIO &pcfg_pull_up>;
 		};
-
 	};
 
 	pmic {
@@ -879,7 +935,6 @@
 			rockchip,pins = <0 13 RK_FUNC_GPIO &pcfg_pull_none>;
 		};
 	};
-
 	rt5640 {
 		rt5640_hpcon: rt5640-hpcon {
 			rockchip,pins = <4 21 RK_FUNC_GPIO &pcfg_pull_none>;
@@ -905,7 +960,6 @@
 			rockchip,pins =
 				<1 18 RK_FUNC_GPIO &pcfg_pull_down>;
 		};
-
 	};
 
 	usb2 {
@@ -914,7 +968,6 @@
 				<1 0 RK_FUNC_GPIO &pcfg_pull_none>;
 		};
 	};
-
 
 	fusb30x {
 		fusb0_int: fusb0-int {
@@ -941,7 +994,7 @@
 	status = "okay";
 };
 
-&rockchip_suspend { 
+&rockchip_suspend {
 	rockchip,power-ctrl =
 		<&gpio1 18 GPIO_ACTIVE_LOW>,
 		<&gpio1 14 GPIO_ACTIVE_HIGH>;
@@ -957,13 +1010,13 @@
 };
 
 &cdn_dp {
-        status = "disabled";
-        extcon = <&fusb0>;
-        phys = <&tcphy0_dp>;
+	status = "disabled";
+	extcon = <&fusb0>;
+	phys = <&tcphy0_dp>;
 };
 
 &dp_in_vopb {
-        status = "disabled";
+	status = "disabled";
 };
 
 &saradc {
@@ -1011,12 +1064,12 @@
 	status = "okay";
 };
 
-&tcphy0 {  
+&tcphy0 {
 	//extcon = <&fusb0>;
 	status = "okay";
 };
 
-&tcphy1 {   
+&tcphy1 {
 	status = "okay";
 };
 
@@ -1028,7 +1081,7 @@
 	status = "okay";
 };
 
-&u2phy0 {   
+&u2phy0 {
 	status = "okay";
 	//extcon = <&fusb0>;
 
@@ -1055,7 +1108,7 @@
 	};
 };
 
-&pwm3 { 
+&pwm3 {
 	status = "okay";
 	interrupts = <GIC_SPI 61 IRQ_TYPE_LEVEL_HIGH 0>;
 	compatible = "rockchip,remotectl-pwm";
@@ -1086,22 +1139,16 @@
 	status = "okay";
 };
 
-&uart2 {  
+&uart2 {
 	status = "okay";
 };
 
-&uart4 {
-       current-speed = <9600>;
-       no-loopback-test;
-       status = "okay";
-};
-
-&usbdrd3_0 {   
+&usbdrd3_0 {
 	status = "okay";
 	//extcon = <&fusb0>;
 };
 
-&usbdrd3_1 {   
+&usbdrd3_1 {
 	status = "okay";
 };
 
@@ -1111,32 +1158,32 @@
 	dr_mode = "host";
 };
 
-&usbdrd_dwc3_1 {   
+&usbdrd_dwc3_1 {
 	status = "okay";
 	dr_mode = "host";
 };
- 
-&usb_host0_ehci { 
+
+&usb_host0_ehci {
 	status = "okay";
 };
 
-&usb_host0_ohci { 
+&usb_host0_ohci {
 	status = "okay";
 };
 
-&usb_host1_ehci {  
+&usb_host1_ehci {
 	status = "okay";
 };
 
-&usb_host1_ohci {  
+&usb_host1_ohci {
 	status = "okay";
 };
 
-&vopb { 
+&vopb {
 	status = "okay";
 };
 
-&vopb_mmu { 
+&vopb_mmu {
 	status = "okay";
 };
 
@@ -1150,6 +1197,4 @@
 
 &vpu {
 	status = "okay";
-	/* 0 means ion, 1 means drm */
-	//allocator = <0>;
 };

@@ -159,11 +159,22 @@ int mmc_of_parse(struct mmc_host *host)
 	int ret;
 	bool cd_cap_invert, cd_gpio_invert = false;
 	bool ro_cap_invert, ro_gpio_invert = false;
+	enum of_gpio_flags pwrseq_flags;
+	int pwrseq_gpio;
 
 	if (!host->parent || !host->parent->of_node)
 		return 0;
 
 	np = host->parent->of_node;
+
+	pwrseq_gpio = of_get_named_gpio_flags(np, "pwrseq-gpio", 0, &pwrseq_flags);
+	if ( gpio_is_valid(pwrseq_gpio) ) {
+		ret = devm_gpio_request_one(&host->class_dev, pwrseq_gpio, (pwrseq_flags & OF_GPIO_ACTIVE_LOW) ? GPIOF_OUT_INIT_LOW : GPIOF_OUT_INIT_HIGH, "sdpwr-gpio");
+		if (ret != 0) {
+			dev_err(&host->class_dev, "request sdcard pwrseq gpio error\n");
+			return -EIO;
+		}
+	};
 
 	/* "bus-width" is translated to MMC_CAP_*_BIT_DATA flags */
 	if (of_property_read_u32(np, "bus-width", &bus_width) < 0) {

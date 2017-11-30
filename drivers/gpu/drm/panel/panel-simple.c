@@ -436,11 +436,7 @@ static int panel_simple_prepare(struct drm_panel *panel)
 	if (p->desc && p->desc->delay.init)
 		msleep(p->desc->delay.init);
 
-	if (p->on_cmds) {
-		err = panel_simple_dsi_send_cmds(p, p->on_cmds);
-		if (err)
-			dev_err(p->dev, "failed to send on cmds\n");
-	}
+
 
 	p->prepared = true;
 
@@ -450,12 +446,19 @@ static int panel_simple_prepare(struct drm_panel *panel)
 static int panel_simple_enable(struct drm_panel *panel)
 {
 	struct panel_simple *p = to_panel_simple(panel);
+	int err;
 
 	if (p->enabled)
 		return 0;
 
 	if (p->desc && p->desc->delay.enable)
 		msleep(p->desc->delay.enable);
+
+	if (p->on_cmds) {
+		err = panel_simple_dsi_send_cmds(p, p->on_cmds);
+		if (err)
+			dev_err(p->dev, "failed to send on cmds\n");
+	}
 
 	if (p->backlight) {
 		p->backlight->props.power = FB_BLANK_UNBLANK;

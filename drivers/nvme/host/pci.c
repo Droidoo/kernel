@@ -2300,6 +2300,8 @@ static void nvme_alloc_ns(struct nvme_dev *dev, unsigned nsid)
 #else
 	disk->is_rk_disk = false;
 #endif
+
+	disk->is_rk_disk = false;
 	sprintf(disk->disk_name, "nvme%dn%d", dev->instance, nsid);
 
 	/*

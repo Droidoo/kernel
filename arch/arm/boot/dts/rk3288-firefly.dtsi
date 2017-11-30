@@ -49,6 +49,7 @@
 	};
 
 	backlight: backlight {
+		status = "disabled";
 		compatible = "pwm-backlight";
 		brightness-levels = <
 			  3   4   5   6   7
@@ -90,6 +91,7 @@
 	};
 
 	panel: panel {
+		status = "disabled";
 		compatible ="lg,lp079qx1-sp0v";
 		power-supply = <&vcc_sys>;
 		backlight = <&backlight>;
@@ -174,6 +176,29 @@
 		 * - PDN (power down when low)
 		 */
 		reset-gpios = <&gpio4 28 GPIO_ACTIVE_LOW>;
+	};
+
+	es8323-sound {
+		status = "okay";
+        compatible = "simple-audio-card";
+        simple-audio-card,format = "i2s";
+        simple-audio-card,name = "rockchip,es8323-codec";
+        simple-audio-card,mclk-fs = <256>;
+        //simple-audio-card,hp-det-gpio = <&gpio7 15 GPIO_ACTIVE_HIGH>;
+		simple-audio-card,widgets =
+				"Microphone","Mic Jack",
+				"Headphone","Headphone Jack";
+		simple-audio-card,routing =
+				"Mic Jack","MICBIAS1",
+				"IN1P","Mic Jack",
+				"Headphone Jack","HPOL",
+				"Headphone Jack","HPOR";
+		simple-audio-card,cpu {
+				sound-dai = <&i2s>;
+		};
+		simple-audio-card,codec {
+				sound-dai = <&es8323>;
+		};
 	};
 
 	sound {
@@ -302,7 +327,7 @@
 	vcc-supply = <&vdd_10>;
 	vccio-supply = <&vcc_18>;
 	force-hpd;
-	status = "okay";
+	status = "disabled";
 
 	ports {
 		edp_out: port@1 {
@@ -322,7 +347,8 @@
 };
 
 &edp_phy {
-	status = "okay";
+	status = "disabled";
+	//status = "okay";
 };
 
 &emmc {
@@ -537,6 +563,17 @@
 
 &i2c2 {
 	status = "okay";
+
+	es8323: es8323@10 {
+        status = "okay";
+		compatible = "everest,es8323";
+		reg = <0x10>;
+		spk-con-gpio = <&gpio7 3 GPIO_ACTIVE_HIGH>;
+		hp-det-gpio = <&gpio7 15 GPIO_ACTIVE_LOW>;
+		clock-names = "mclk";
+		clocks = <&cru SCLK_I2S0_OUT>;
+		#sound-dai-cells = <0>;
+	};
 };
 
 &i2c4 {
@@ -680,6 +717,11 @@
 			rockchip,pins = <4 19 RK_FUNC_GPIO &pcfg_pull_none>;
 		};
 	};
+};
+
+&i2s {
+	status = "okay";
+	#sound-dai-cells = <0>;
 };
 
 &saradc {

@@ -46,6 +46,11 @@
 #define RT5640_PR_SPACING 0x100
 #define RT5640_PR_BASE (RT5640_PR_RANGE_BASE + (0 * RT5640_PR_SPACING))
 
+#define LINE_IN_OKAY 1
+#define LINE_IN_NO   0
+static int line_in_status = 0;
+static bool aux_irq_flag = true;  /*true:enable   false:disable*/
+
 static const struct regmap_range_cfg rt5640_ranges[] = {
 	{ .name = "PR", .range_min = RT5640_PR_BASE,
 	  .range_max = RT5640_PR_BASE + 0xb4,
@@ -174,12 +179,130 @@ static const struct reg_default rt5640_reg[] = {
 static void rt5640_hp_gpio_ctrl(struct rt5640_priv *rt5640, bool enable)
 {
 	dev_dbg(rt5640->codec->dev, "hp-con-gpio enable=%d\n", enable);
+	if (line_in_status && (false == enable))
+		return;
 	if (enable)
 		gpio_set_value(rt5640->hp_con_gpio,
 			       rt5640->hp_con_gpio_active_high ? 1 : 0);
 	else
 		gpio_set_value(rt5640->hp_con_gpio,
 			       rt5640->hp_con_gpio_active_high ? 0 : 1);
+}
+
+static void rt5640_set_linein(struct rt5640_priv *rt5640)//struct snd_soc_codec *code/)
+{
+	printk("%s enter\n",__func__);
+	//regmap_write(rt5640->regmap, RT5640_RESET, 0);
+	regmap_write(rt5640->regmap, RT5640_PWR_ANLG1, 0xfdfc);     //63
+	regmap_update_bits(rt5640->regmap, RT5640_REC_L2_MIXER,    //3c
+		                1<<5 | 1<<4,
+                        0<<5 | 1<<4);
+	regmap_update_bits(rt5640->regmap, RT5640_REC_R2_MIXER,    //3e
+		                1<<5 | 1<<4,
+                        0<<5 | 1<<4);
+
+	regmap_update_bits(rt5640->regmap, RT5640_OUT_L3_MIXER,    //4f
+		                1<<3 , 0<<3);
+	regmap_update_bits(rt5640->regmap, RT5640_OUT_R3_MIXER,    //52
+		                1<<3 , 0<<3);
+
+	regmap_write(rt5640->regmap, RT5640_HP_VOL, 0x0808);        //02
+	regmap_update_bits(rt5640->regmap, RT5640_HPO_MIXER,        //45
+		                1<<13 | 1<<12,
+		                0<<13 | 1<<12);
+
+	regmap_update_bits(rt5640->regmap, RT5640_PWR_MIXER,    //65
+		                1<<10 | 1<<11 | 1<<14 | 1<<15,
+                        1<<10 | 1<<11 | 1<<14 | 1<<15);
+	regmap_update_bits(rt5640->regmap, RT5640_PWR_VOL,    //66
+		                1<<8 | 1<<9 | 1<<10 | 1<<11,
+                        1<<8 | 1<<9 | 1<<10 | 1<<11);
+
+	regmap_write(rt5640->regmap, RT5640_DEPOP_M1, 0x8019);     //8e
+	regmap_write(rt5640->regmap, RT5640_DEPOP_M2, 0x3100);     //8f
+
+	regmap_write(rt5640->regmap, RT5640_DUMMY1, 0x3401);     //fa
+
+	rt5640_hp_gpio_ctrl(rt5640, 1);
+}
+
+static void aux_det_work_func(struct work_struct *work)
+{
+	struct rt5640_priv *rt5640 = container_of(work, struct rt5640_priv, aux_det_work.work);
+	line_in_status = gpio_get_value(rt5640->aux_det_gpio);
+	printk("%s", __func__);
+
+	if (line_in_status == LINE_IN_OKAY){
+		printk(" [on] \n");
+		rt5640_set_linein(rt5640);
+	}
+	else if (line_in_status == LINE_IN_NO)
+	{
+		printk(" [off]\n");
+	}
+
+	if(!aux_irq_flag) {
+		enable_irq(rt5640->aux_det_irq);
+		aux_irq_flag = true;
+	}
+}
+
+static irqreturn_t aux_det_isr(int irq, void *data)
+{
+	struct rt5640_priv *rt5640 = data;
+
+	printk("%s\n", __func__);
+
+	line_in_status = gpio_get_value(rt5640->aux_det_gpio);
+	if(aux_irq_flag) {
+		disable_irq_nosync(rt5640->aux_det_irq);
+		aux_irq_flag = false;
+	}
+
+	if (line_in_status == LINE_IN_OKAY) {
+		//set line in on
+		printk(" line_in: [on] \n");
+		line_in_status = LINE_IN_OKAY;
+		schedule_delayed_work(&rt5640->aux_det_work, msecs_to_jiffies(0));
+		//rt5640_set_linein(rt5640);
+	}
+	else if (line_in_status == LINE_IN_NO) {
+		//set line in off
+		printk(" line_in: [off] \n");
+		if (!aux_irq_flag) {
+			enable_irq(rt5640->aux_det_irq);
+			aux_irq_flag = true;
+		}
+		line_in_status = LINE_IN_NO;
+	}
+
+	return IRQ_HANDLED;
+}
+
+static void rt5640_delay_workq(struct work_struct *work)
+{
+	int ret;
+	struct rt5640_priv *rt5640 = container_of(work, struct rt5640_priv, init_delayed_work.work);
+	printk("%s\n", __func__);
+
+	rt5640->aux_det_irq = gpio_to_irq(rt5640->aux_det_gpio);
+	if (rt5640->aux_det_irq < 0) {
+        gpio_free(rt5640->aux_det_gpio);
+		printk("aux_det_irq req fail\n");
+	}
+	else {
+		ret = request_irq(rt5640->aux_det_irq, aux_det_isr,  IRQF_TRIGGER_FALLING | IRQF_TRIGGER_RISING, "irq_aux_det", rt5640);
+		if (ret)
+			printk(KERN_ALERT "Cannot allocate linein INT!ERRNO:%d\n", ret);
+		else {
+			if (aux_irq_flag) {
+				disable_irq(rt5640->aux_det_irq);
+				aux_irq_flag = false;
+			}
+		}
+	}
+
+	schedule_delayed_work(&rt5640->aux_det_work, msecs_to_jiffies(100));
 }
 
 static int rt5640_reset(struct snd_soc_codec *codec)
@@ -2028,6 +2151,7 @@ static int rt5640_set_bias_level(struct snd_soc_codec *codec,
 						0x0301, 0x0301);
 			snd_soc_update_bits(codec, RT5640_MICBIAS,
 						0x0030, 0x0030);
+			snd_soc_write(codec, RT5640_PWR_ANLG2, 0x0800); //micbas1
 		}
 		break;
 
@@ -2117,21 +2241,21 @@ static void rt5640_hp_adc_poll(struct work_struct *work)
 	int result = -1;
 
 	rt5640 = container_of(work, struct rt5640_priv, adc_poll_work.work);
-		result = rt5640_hp_adc_iio_read(rt5640);
-		if (result > RT5640_ADC_INVALID_ADVALUE &&
-		    result < RT5640_ADC_EMPTY_ADVALUE) {
-			if (result < rt5640->hp_det_adc_value + RT5640_ADC_DRIFT_ADVALUE &&
-			    result > rt5640->hp_det_adc_value - RT5640_ADC_DRIFT_ADVALUE){
-		if (!rt5640->hp_insert) {
-			dev_dbg(rt5640->codec->dev,
-				"headphone insert,adc=%d\n", result);
-			rt5640->hp_insert = true;
-				snd_soc_jack_report(&rt5640->hp_jack, SND_JACK_HEADPHONE,
-						    SND_JACK_HEADPHONE);
-			if (!rt5640->hp_mute)
-				rt5640_hp_gpio_ctrl(rt5640, true);
-		}
-	} else{
+	result = rt5640_hp_adc_iio_read(rt5640);
+	if (result > RT5640_ADC_INVALID_ADVALUE &&
+		result < RT5640_ADC_EMPTY_ADVALUE) {
+		if (result < rt5640->hp_det_adc_value + RT5640_ADC_DRIFT_ADVALUE &&
+			result > rt5640->hp_det_adc_value - RT5640_ADC_DRIFT_ADVALUE){
+	if (!rt5640->hp_insert) {
+		dev_dbg(rt5640->codec->dev,
+			"headphone insert,adc=%d\n", result);
+		rt5640->hp_insert = true;
+			snd_soc_jack_report(&rt5640->hp_jack, SND_JACK_HEADPHONE,
+						SND_JACK_HEADPHONE);
+		if (!rt5640->hp_mute)
+			rt5640_hp_gpio_ctrl(rt5640, true);
+	}
+	} else {
 		if (rt5640->hp_insert) {
 			dev_dbg(rt5640->codec->dev,
 				"headphone not insert,adc=%d\n", result);
@@ -2205,6 +2329,12 @@ static int rt5640_probe(struct snd_soc_codec *codec)
 		schedule_delayed_work(&rt5640->adc_poll_work,
 				      1000);
 	}
+
+    /* Init workquence to set up line in func */
+	INIT_DELAYED_WORK(&rt5640->init_delayed_work, rt5640_delay_workq);
+	INIT_DELAYED_WORK(&rt5640->aux_det_work, aux_det_work_func);
+
+	schedule_delayed_work(&rt5640->init_delayed_work, msecs_to_jiffies(20000));
 
 	return 0;
 }
@@ -2368,16 +2498,17 @@ static int rt5640_parse_dt(struct rt5640_priv *rt5640, struct device *dev)
 	struct iio_channel *chan;
 	u32 adc_value;
 	enum of_gpio_flags flags;
+	unsigned long irq_flags;
 	int gpio, ret;
 
 	chan = iio_channel_get(dev, NULL);
 	if (IS_ERR(chan)) {
 		dev_warn(dev, "rt5640 have no io-channels defined\n");
 		chan = NULL;
-	} else{
+	} else {
 		if (!of_property_read_u32(np, "hp-det-adc-value", &adc_value)) {
 			rt5640->hp_det_adc_value = adc_value;
-		} else{
+		} else {
 			chan = NULL;
 			dev_err(dev, "rt5640 have no hp_det_adc_value defined\n");
 		}
@@ -2397,6 +2528,23 @@ static int rt5640_parse_dt(struct rt5640_priv *rt5640, struct device *dev)
 			gpio_direction_output(gpio, rt5640->hp_con_gpio_active_high ? 0 : 1);
 	}
 	rt5640->hp_con_gpio = gpio;
+
+	gpio = of_get_named_gpio_flags(np, "aux-det-gpio", 0, (enum of_gpio_flags *)&irq_flags);
+	if (gpio < 0) {
+		dev_err(dev, "Can not read property aux-det-gpio\n");
+	} else {
+		if (gpio_is_valid(gpio)) {
+			ret = devm_gpio_request(dev, gpio, "aux-det-gpio");
+			if (ret < 0) {
+				dev_err(dev, "aux-det-gpio request ERROR\n");
+			} else {
+				ret = gpio_direction_input(gpio);
+				if (ret < 0)
+					dev_err(dev, "gpio_direction_input aux-det-gpio set ERROR\n");
+			}
+		}
+	}
+	rt5640->aux_det_gpio = gpio;
 
 	rt5640->pdata.in1_diff = of_property_read_bool(np,
 					"realtek,in1-differential");

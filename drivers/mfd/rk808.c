@@ -24,6 +24,9 @@
 #include <linux/module.h>
 #include <linux/of_device.h>
 #include <linux/regmap.h>
+#include <linux/of_gpio.h>
+#include <linux/gpio.h>
+#include <linux/delay.h>
 
 struct rk808_reg_data {
 	int addr;
@@ -65,7 +68,22 @@ static int rk808_shutdown(struct regmap *regmap)
 
 	ret = regmap_update_bits(regmap,
 				 RK808_DEVCTRL_REG,
-				 DEV_OFF_RST, DEV_OFF_RST);
+				 DEV_OFF, DEV_OFF);
+	if (ret)
+		printk("DEV_OFF error!\n");
+
+	mdelay(2);
+	ret = regmap_update_bits(regmap,
+				 RK808_DCDC_EN_REG,
+				 BUCK1_EN_MASK | BUCK2_EN_MASK | BUCK3_EN_MASK | BUCK4_EN_MASK, 0xf);
+	if (ret)
+		printk("RK808_DCDC_EN_REG error!\n");
+	ret = regmap_update_bits(regmap,
+				 RK808_LDO_EN_REG,
+				 0xff, 0xff);
+	if (ret)
+		printk("RK808_LDO_EN_REG error!\n");
+
 	return ret;
 }
 
@@ -555,6 +573,15 @@ static void rk808_device_shutdown_prepare(void)
 	int ret;
 	struct rk808 *rk808 = i2c_get_clientdata(rk808_i2c_client);
 
+    if (gpio_is_valid(rk808->stby_gpio)) {
+        printk("rk808->stby_gpio(%d)=low\n", rk808->stby_gpio);
+        gpio_direction_output(rk808->stby_gpio, 0);
+    }
+    if (gpio_is_valid(rk808->hold_gpio)) {
+        printk("rk808->hold_gpio(%d)=low\n", rk808->hold_gpio);
+        gpio_direction_output(rk808->hold_gpio, 0);
+        mdelay(200);
+    }
 	if (!rk808) {
 		dev_warn(&rk808_i2c_client->dev,
 			 "have no rk808, so do nothing here\n");
@@ -581,17 +608,30 @@ static void rk808_device_shutdown(void)
 	}
 
 	/* close rtc int when power off */
+#if 0
 	regmap_update_bits(rk808->regmap,
 			   RK808_INT_STS_MSK_REG1,
 			   (0x3 << 5), (0x3 << 5));
 	regmap_update_bits(rk808->regmap,
 			   RK808_RTC_INT_REG,
 			   (0x3 << 2), (0x0 << 2));
+#endif
+
+	if (gpio_is_valid(rk808->stby_gpio)) {
+	    printk("rk808->stby_gpio(%d)=low\n", rk808->stby_gpio);
+	    gpio_direction_output(rk808->stby_gpio, 0);
+	}
+	if (gpio_is_valid(rk808->hold_gpio)) {
+	    printk("rk808->hold_gpio(%d)=low\n", rk808->hold_gpio);
+	    gpio_direction_output(rk808->hold_gpio, 0);
+	    mdelay(200);
+	}
 	if (pm_shutdown) {
 		ret = pm_shutdown(rk808->regmap);
 		if (ret)
 			dev_err(&rk808_i2c_client->dev, "power off error!\n");
 	}
+    printk("%s-%d: pm_shutdown\n", __FUNCTION__, __LINE__);
 }
 
 static ssize_t rk8xx_dbg_store(struct device *dev,
@@ -820,6 +860,36 @@ static int rk808_probe(struct i2c_client *client,
 		ret = sysfs_create_file(rk8xx_kobj, &rk8xx_attrs.attr);
 		if (ret)
 			dev_err(&client->dev, "create rk8xx sysfs error\n");
+	}
+	//pmic,hold-gpio
+	rk808->hold_gpio = of_get_named_gpio(np, "pmic,hold-gpio", 0);
+	if (gpio_is_valid(rk808->hold_gpio)) {
+		ret = devm_gpio_request(&client->dev, rk808->hold_gpio, "pmic-hold-gpio");
+		if(ret < 0){
+			dev_err(&client->dev, "pmic-hold-gpio request ERROR\n");
+			goto err_irq;
+		}
+        dev_dbg(&client->dev, "hold_gpio(%d)=high\n", rk808->hold_gpio);
+        gpio_direction_output(rk808->hold_gpio, 1);
+	}
+    else {
+		dev_err(&client->dev, "Can not read property pmic,hold-gpio\n");
+		//goto err_irq;
+    }
+
+	//pmic,stby-gpio
+	rk808->stby_gpio = of_get_named_gpio(np, "pmic,stby-gpio", 0);
+	if (gpio_is_valid(rk808->stby_gpio)) {
+		ret = devm_gpio_request(&client->dev, rk808->stby_gpio, "pmic-stby-gpio");
+		if(ret < 0){
+			dev_err(&client->dev, "devm_gpio_request pmic-stby-gpio request ERROR\n");
+			goto err_irq;
+		}
+        dev_dbg(&client->dev, "stby_gpio(%d)=low\n", rk808->stby_gpio);
+        gpio_direction_output(rk808->stby_gpio, 1);
+	} else {
+		dev_err(&client->dev, "Can not read property pmic,stby-gpio\n");
+		//goto err_irq;
 	}
 
 	return 0;

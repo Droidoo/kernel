@@ -1925,11 +1925,17 @@
 		reset-names = "apb";
 		power-domains = <&power RK3399_PD_VIO>;
 		rockchip,grf = <&grf>;
+
 		#address-cells = <1>;
 		#size-cells = <0>;
 		status = "disabled";
 
 		ports {
+
+			#address-cells = <1>;
+			#size-cells = <0>;
+			reg = <1>;
+
 			port {
 				#address-cells = <1>;
 				#size-cells = <0>;
