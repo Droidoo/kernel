@@ -344,7 +344,7 @@
 		compatible = "bluetooth-platdata";
 		//wifi-bt-power-toggle;
 		clocks = <&rk808 1>;
-        clock-names = "ext_clock";
+                clock-names = "ext_clock";
 		uart_rts_gpios = <&gpio2 19 GPIO_ACTIVE_LOW>; /* GPIO2_C3 */
 		pinctrl-names = "default", "rts_gpio";
 		pinctrl-0 = <&uart0_rts>;
@@ -356,23 +356,23 @@
 		status = "okay";
 	};
 
-	leds {
-		compatible = "gpio-leds";
-		power {
-			label = "firefly:blue:power";
-			linux,default-trigger = "ir-power-click";
-			default-state = "on";
-			gpios = <&gpio2 27 GPIO_ACTIVE_HIGH>;
-			pinctrl-names = "default";
-			pinctrl-0 = <&led_power>;
-		};
-		user {
-			label = "firefly:yellow:user";
-			linux,default-trigger = "ir-user-click";
-			default-state = "off";
-			gpios = <&gpio0 13 GPIO_ACTIVE_HIGH>;
-			pinctrl-names = "default";
-			pinctrl-0 = <&led_user>;
+    leds {
+       compatible = "gpio-leds";
+       power {
+           label = "firefly:blue:power";
+           linux,default-trigger = "ir-power-click";
+           default-state = "on";
+           gpios = <&gpio2 27 GPIO_ACTIVE_HIGH>;
+           pinctrl-names = "default";
+           pinctrl-0 = <&led_power>;
+       };
+       user {
+           label = "firefly:yellow:user";
+           linux,default-trigger = "ir-user-click";
+           default-state = "off";
+           gpios = <&gpio0 13 GPIO_ACTIVE_HIGH>;
+           pinctrl-names = "default";
+           pinctrl-0 = <&led_user>;
        };
    };
 };
@@ -498,7 +498,7 @@
 	pinctrl-names = "default";
 	pinctrl-0 = <&rgmii_pins>;
 	tx_delay = <0x28>;
-	rx_delay = <0x11>;
+	rx_delay = <0x1B>;
 	status = "okay";
 };
 
@@ -511,6 +511,7 @@
 	#address-cells = <1>;
 	#size-cells = <0>;
 	#sound-dai-cells = <0>;
+	//ddc-i2c-bus = <&i2c3>;
 	status = "okay";
 };
 
@@ -562,8 +563,10 @@
 		reg = <0x1b>;
 		interrupt-parent = <&gpio1>;
 		interrupts = <21 IRQ_TYPE_LEVEL_LOW>;
+		pmic,stby-gpio = <&gpio1 24 GPIO_ACTIVE_LOW>;
+		pmic,hold-gpio = <&gpio1 13 GPIO_ACTIVE_HIGH>;
 		pinctrl-names = "default";
-		pinctrl-0 = <&pmic_int_l &pmic_dvs2>;
+		pinctrl-0 = <&pmic_int_l &pmic_dvs2 &pmic_stby &pmic_hold>;
 		rockchip,system-power-controller;
 		wakeup-source;
 		#clock-cells = <1>;
@@ -746,7 +749,7 @@
 	i2c-scl-rising-time-ns = <300>;
 	i2c-scl-falling-time-ns = <15>;
 
-    es8323: es8323@10{
+	es8323: es8323@10 {
 		compatible = "everest,es8323";
 		reg = <0x10>;
 		ear-con-gpio = <&gpio0 12 GPIO_ACTIVE_HIGH>;
@@ -759,6 +762,7 @@
 		pinctrl-names = "default";
 		pinctrl-0 = <&es8323_earcon &es8323_hpdet>;
 	};
+
 	rt5640: rt5640@1c {
 		status = "disabled";
 		#sound-dai-cells = <0>;
@@ -803,6 +807,9 @@
 		reg = <0x40>;
 		screen_max_x = <1536>;
 		screen_max_y = <2048>;
+		revert_xy = <0>;
+		revert_x = <0>;
+		revert_y = <0>;
 		touch-gpio = <&gpio4 28 IRQ_TYPE_LEVEL_LOW>;
 		reset-gpio = <&gpio4 21 GPIO_ACTIVE_HIGH>;
 	};
@@ -874,17 +881,19 @@
 &pinctrl {
 	buttons {
 		pwrbtn: pwrbtn {
-			rockchip,pins = <0 5 RK_FUNC_GPIO &pcfg_pull_up>;
+			rockchip,pins =
+				<0 5 RK_FUNC_GPIO &pcfg_pull_up>;
 		};
 	};
 
 	lcd-panel {
 		lcd_panel_reset: lcd-panel-reset {
-			rockchip,pins = <4 29 RK_FUNC_GPIO &pcfg_pull_up>;
+			rockchip,pins =
+				<4 29 RK_FUNC_GPIO &pcfg_pull_up>;
 		};
-
 		lcd_en: lcd-en {
-			rockchip,pins = <1 1 RK_FUNC_GPIO &pcfg_pull_up>;
+			rockchip,pins =
+				<1 1 RK_FUNC_GPIO &pcfg_pull_up>;
 		};
 	};
 
@@ -892,8 +901,8 @@
 		pcie_drv: pcie-drv {
 			rockchip,pins =
 				<1 17 RK_FUNC_GPIO &pcfg_pull_none>;
-			};
-			pcie_3g_drv: pcie-3g-drv {
+		};
+		pcie_3g_drv: pcie-3g-drv {
 			rockchip,pins =
 				<0 2 RK_FUNC_GPIO &pcfg_pull_up>;
 		};
@@ -904,10 +913,17 @@
 			rockchip,pins =
 				<1 18 RK_FUNC_GPIO &pcfg_pull_down>;
 		};
-
 		vsel2_gpio: vsel2-gpio {
 			rockchip,pins =
-			<1 14 RK_FUNC_GPIO &pcfg_pull_down>;
+				<1 14 RK_FUNC_GPIO &pcfg_pull_down>;
+		};
+		pmic_stby: pmic-stby {
+			rockchip,pins =
+				<1 24 RK_FUNC_GPIO &pcfg_pull_up>;
+		};
+		pmic_hold: pmic-hold{
+			rockchip,pins =
+				<1 13 RK_FUNC_GPIO &pcfg_pull_up>;
 		};
 	};
 
@@ -928,25 +944,30 @@
 
 	leds {
 		led_power: led-power {
-			rockchip,pins = <2 27 RK_FUNC_GPIO &pcfg_pull_none>;
+			rockchip,pins =
+				<2 27 RK_FUNC_GPIO &pcfg_pull_none>;
 		};
-
 		led_user: led-user {
-			rockchip,pins = <0 13 RK_FUNC_GPIO &pcfg_pull_none>;
+			rockchip,pins =
+				<0 13 RK_FUNC_GPIO &pcfg_pull_none>;
 		};
 	};
+
 	rt5640 {
 		rt5640_hpcon: rt5640-hpcon {
-			rockchip,pins = <4 21 RK_FUNC_GPIO &pcfg_pull_none>;
+			rockchip,pins =
+				<4 21 RK_FUNC_GPIO &pcfg_pull_none>;
 		};
 	};
 
 	es8223 {
 		es8323_hpdet: es8323-hpdet {
-			rockchip,pins = <0 11 RK_FUNC_GPIO &pcfg_pull_up>;
+			rockchip,pins =
+				<0 11 RK_FUNC_GPIO &pcfg_pull_up>;
 		};
 		es8323_earcon: es8323-earcon {
-			rockchip,pins = <0 12 RK_FUNC_GPIO &pcfg_pull_none>;
+			rockchip,pins =
+				<0 12 RK_FUNC_GPIO &pcfg_pull_none>;
 		};
 	};
 
@@ -955,7 +976,6 @@
 			rockchip,pins =
 				<1 21 RK_FUNC_GPIO &pcfg_pull_up>;
 		};
-
 		pmic_dvs2: pmic-dvs2 {
 			rockchip,pins =
 				<1 18 RK_FUNC_GPIO &pcfg_pull_down>;
@@ -971,13 +991,15 @@
 
 	fusb30x {
 		fusb0_int: fusb0-int {
-			rockchip,pins = <1 2 RK_FUNC_GPIO &pcfg_pull_up>;
+			rockchip,pins =
+				<1 2 RK_FUNC_GPIO &pcfg_pull_up>;
 		};
 	};
 
 	vbus {
 		vbus_5v_drv: vbus-5v-drv {
-			rockchip,pins = <1 3 RK_FUNC_GPIO &pcfg_pull_up>;
+			rockchip,pins =
+				<1 3 RK_FUNC_GPIO &pcfg_pull_up>;
 		};
 	};
 };
@@ -1016,6 +1038,22 @@
 };
 
 &dp_in_vopb {
+	status = "disabled";
+};
+
+&hdmi_in_vopb {
+	status = "disabled";
+};
+
+&hdmi_in_vopl {
+	status = "okay";
+};
+
+&dsi_in_vopb {
+	status = "okay";
+};
+
+&dsi_in_vopl {
 	status = "disabled";
 };
 
@@ -1064,7 +1102,7 @@
 	status = "okay";
 };
 
-&tcphy0 {
+&tcphy0 {  
 	//extcon = <&fusb0>;
 	status = "okay";
 };
@@ -1115,7 +1153,7 @@
 	remote_pwm_id = <3>;
 	handle_cpu_id = <0>;
 
-    ir_key1{
+    ir_key1 {
         rockchip,usercode = <0xff00>;
         rockchip,key_table =
             <0xeb   KEY_POWER>,
@@ -1140,6 +1178,12 @@
 };
 
 &uart2 {
+	status = "okay";
+};
+
+&uart4 {
+	current-speed = <9600>;
+	no-loopback-test;
 	status = "okay";
 };
 
@@ -1197,4 +1241,6 @@
 
 &vpu {
 	status = "okay";
+	/* 0 means ion, 1 means drm */
+	//allocator = <0>;
 };

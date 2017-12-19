@@ -2111,11 +2111,10 @@ struct rt5640_priv {
 	bool hp_insert;
 	int hp_con_gpio;
 	bool hp_con_gpio_active_high;
-	struct delayed_work init_delayed_work;
-	struct delayed_work aux_det_work;
-	int aux_det_gpio;
-	int aux_det_irq;
 	struct snd_soc_jack hp_jack;
+	struct delayed_work adc_aux_work;
+	struct iio_channel *aux_chan;
+	int aux_det_adc_value;
 };
 
 int rt5640_dmic_enable(struct snd_soc_codec *codec,
