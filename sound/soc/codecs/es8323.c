@@ -36,11 +36,16 @@
 #include "es8323.h"
 
 #define INVALID_GPIO -1
+int es8323_line_det_gpio = INVALID_GPIO;
+int LINE_IRQ = 0;
 
-#define ES8323_CODEC_SET_SPK	1
-#define ES8323_CODEC_SET_HP	2
+#define ES8323_CODEC_SET_EAR	1
+#define ES8323_CODEC_SET_HP		2
+#define ES8323_CODEC_SET_SPK	3
+#define LINE_IN_OKAY 1
+#define LINE_IN_NO   0
 
-#define es8323_DEF_VOL	0x20
+#define es8323_DEF_VOL	0x1e
 
 static int es8323_set_bias_level(struct snd_soc_codec *codec,
 				 enum snd_soc_bias_level level);
@@ -75,12 +80,18 @@ struct es8323_priv {
 
 	int spk_ctl_gpio;
 	int hp_det_gpio;
+	int ear_ctl_gpio;
 
 	bool muted;
 	bool hp_inserted;
 	bool spk_gpio_level;
 	bool hp_det_level;
+	bool ear_gpio_level;
+	bool line_in_status;
 };
+
+static void line_detect_do_switch(struct work_struct *work);
+static DECLARE_DELAYED_WORK(line_wakeup_work, line_detect_do_switch);
 
 static struct es8323_priv *es8323_private;
 static int es8323_set_gpio(int gpio, bool level)
@@ -91,6 +102,10 @@ static int es8323_set_gpio(int gpio, bool level)
 		return 0;
 	}
 
+	if ((gpio & ES8323_CODEC_SET_EAR) && es8323
+	    && es8323->ear_ctl_gpio != INVALID_GPIO) {
+		gpio_set_value(es8323->ear_ctl_gpio, level);
+	}
 	if ((gpio & ES8323_CODEC_SET_SPK) && es8323
 	    && es8323->spk_ctl_gpio != INVALID_GPIO) {
 		gpio_set_value(es8323->spk_ctl_gpio, level);
@@ -99,21 +114,63 @@ static int es8323_set_gpio(int gpio, bool level)
 	return 0;
 }
 
+static void spk_detect_do_switch(int ctrl)
+{
+	struct es8323_priv *es8323 = es8323_private;
+
+    if (ctrl == 1) {
+        if (es8323->hp_det_level == es8323->hp_inserted)
+        {
+            if (es8323->ear_ctl_gpio != INVALID_GPIO) {
+				es8323_set_gpio(ES8323_CODEC_SET_EAR, es8323->ear_gpio_level);
+			}
+            if (es8323->spk_ctl_gpio != INVALID_GPIO) {
+				es8323_set_gpio(ES8323_CODEC_SET_SPK, !es8323->spk_gpio_level);
+			}
+        }
+        else {
+            if (es8323->ear_ctl_gpio != INVALID_GPIO)
+				es8323_set_gpio(ES8323_CODEC_SET_EAR, !es8323->ear_gpio_level);
+            if (es8323->spk_ctl_gpio != INVALID_GPIO)
+				es8323_set_gpio(ES8323_CODEC_SET_SPK, es8323->spk_gpio_level);
+        }
+    } else {
+		if (es8323->ear_ctl_gpio != INVALID_GPIO)
+			es8323_set_gpio(ES8323_CODEC_SET_EAR, !es8323->ear_gpio_level);
+		if (es8323->spk_ctl_gpio != INVALID_GPIO)
+			es8323_set_gpio(ES8323_CODEC_SET_SPK, !es8323->spk_gpio_level);
+    }
+}
+
 static irqreturn_t hp_det_irq_handler(int irq, void *dev_id)
 {
 	struct es8323_priv *es8323 = es8323_private;
 
-	if (gpio_get_value(es8323->hp_det_gpio))
+	if (!gpio_get_value(es8323->hp_det_gpio))
 		es8323->hp_inserted = 0;
 	else
 		es8323->hp_inserted = 1;
 
+	/*
 	if (es8323->muted == 0) {
 		if (es8323->hp_det_level != es8323->hp_inserted)
-			es8323_set_gpio(ES8323_CODEC_SET_SPK, !es8323->spk_gpio_level);
+			es8323_set_gpio(ES8323_CODEC_SET_EAR, !es8323->ear_gpio_level);
 		else
-			es8323_set_gpio(ES8323_CODEC_SET_SPK, es8323->spk_gpio_level);
+			es8323_set_gpio(ES8323_CODEC_SET_EAR, es8323->ear_gpio_level);
 	}
+	*/
+	if (es8323->line_in_status == LINE_IN_NO)
+		spk_detect_do_switch(!es8323->muted);
+	else
+		spk_detect_do_switch(1);
+
+	return IRQ_HANDLED;
+}
+
+static irqreturn_t line_det_irq_handler(int irq, void *dev_id)
+{
+	disable_irq_nosync(irq);
+	schedule_delayed_work(&line_wakeup_work, msecs_to_jiffies(250));
 	return IRQ_HANDLED;
 }
 
@@ -667,18 +724,26 @@ static int es8323_mute(struct snd_soc_dai *dai, int mute)
 
 	es8323->muted = mute;
 	if (mute) {
-		es8323_set_gpio(ES8323_CODEC_SET_SPK, !es8323->spk_gpio_level);
-		usleep_range(18000, 20000);
-		snd_soc_write(codec, ES8323_DACCONTROL3, 0x06);
+			//es8323_set_gpio(ES8323_CODEC_SET_SPK, !es8323->spk_gpio_level);
+			usleep_range(18000, 20000);
+			snd_soc_write(codec, ES8323_DACCONTROL3, 0x06);
 	} else {
 		snd_soc_write(codec, ES8323_DACCONTROL3, 0x02);
 		snd_soc_write(codec, 0x30, es8323_DEF_VOL);
 		snd_soc_write(codec, 0x31, es8323_DEF_VOL);
 		msleep(50);
+		/*
 		if (!es8323->hp_inserted)
 			es8323_set_gpio(ES8323_CODEC_SET_SPK, es8323->spk_gpio_level);
+		*/
 		usleep_range(18000, 20000);
 	}
+
+	if (es8323->line_in_status == LINE_IN_NO)
+		spk_detect_do_switch(!es8323->muted);
+	else
+		spk_detect_do_switch(1);
+
 	return 0;
 }
 
@@ -798,6 +863,7 @@ static int es8323_probe(struct snd_soc_codec *codec)
 {
 	struct es8323_priv *es8323 = snd_soc_codec_get_drvdata(codec);
 	int ret = 0;
+	int flags;
 
 	if (codec == NULL) {
 		dev_err(codec->dev, "Codec device not registered\n");
@@ -815,6 +881,32 @@ static int es8323_probe(struct snd_soc_codec *codec)
 
 	codec->hw_write = (hw_write_t) i2c_master_send;
 	codec->control_data = container_of(codec->dev, struct i2c_client, dev);
+
+	if (es8323_line_det_gpio  != INVALID_GPIO) {
+		ret = gpio_request(es8323_line_det_gpio, "line_det");
+		if (ret != 0) {
+			printk("%s request line_DET error", __func__);
+			return ret;
+		}
+
+		gpio_direction_input(es8323_line_det_gpio);
+		flags = gpio_get_value(es8323_line_det_gpio) ? IRQF_TRIGGER_FALLING : IRQF_TRIGGER_RISING;
+
+		LINE_IRQ = gpio_to_irq(es8323_line_det_gpio);
+		if (LINE_IRQ){
+			ret = request_irq(LINE_IRQ, line_det_irq_handler, flags, "ES8323", NULL);
+			if(ret == 0){
+				printk("%s:register ISR (irq=%d)\n", __FUNCTION__,LINE_IRQ);
+			}
+			else
+				printk("request_irq LINE_IRQ failed\n");
+		}
+		disable_irq(LINE_IRQ);
+		schedule_delayed_work(&line_wakeup_work, msecs_to_jiffies(500));
+	}
+	if (gpio_get_value(es8323->hp_det_gpio) == es8323->hp_det_level) {
+		es8323->hp_inserted = 1;
+	}
 
 	es8323_codec = codec;
 	ret = es8323_reset(codec);
@@ -871,7 +963,49 @@ static int es8323_probe(struct snd_soc_codec *codec)
 	snd_soc_write(codec, 0x04, 0x2c);	/* pdn_ana=0,ibiasgen_pdn=0 */
 
 	es8323_set_bias_level(codec, SND_SOC_BIAS_STANDBY);
+
 	return 0;
+}
+
+static void line_detect_do_switch(struct work_struct *work)
+{
+	int level;
+	struct es8323_priv *es8323 = es8323_private;
+	int irq = gpio_to_irq(es8323_line_det_gpio);
+
+	level = gpio_get_value(es8323_line_det_gpio);
+
+	if (level == 0)
+	{
+        printk("%s Enter line in mode\n",__func__);
+		es8323->line_in_status = LINE_IN_OKAY;
+
+		snd_soc_write(es8323_codec, 0x26, 0x00);
+        snd_soc_write(es8323_codec, 0x27, 0x40);
+        snd_soc_write(es8323_codec, 0x2a, 0x40);
+        snd_soc_write(es8323_codec, 0x0b, 0x02);
+        snd_soc_write(es8323_codec, 0x04, 0x0c);
+
+        spk_detect_do_switch(1);
+
+		irq_set_irq_type(irq,  IRQ_TYPE_EDGE_RISING);
+	}
+	else {
+        printk("%s Exit line in mode\n",__func__);
+		es8323->line_in_status = LINE_IN_NO;
+
+		snd_soc_write(es8323_codec, 0x26, 0x12);
+        snd_soc_write(es8323_codec, 0x27, 0xb8);
+        snd_soc_write(es8323_codec, 0x2a, 0xb8);
+        snd_soc_write(es8323_codec, 0x0b, 0x82);
+        snd_soc_write(es8323_codec, 0x04, 0x3c);
+
+        spk_detect_do_switch(!es8323->muted);
+
+		irq_set_irq_type(irq, IRQ_TYPE_EDGE_FALLING);
+	}
+
+	enable_irq(irq);
 }
 
 static int es8323_remove(struct snd_soc_codec *codec)
@@ -931,12 +1065,26 @@ static int es8323_i2c_probe(struct i2c_client *i2c,
 		es8323->spk_ctl_gpio = INVALID_GPIO;
 	} else {
 		es8323->spk_gpio_level = (flags & OF_GPIO_ACTIVE_LOW) ? 0 : 1;
-		ret = devm_gpio_request_one(&i2c->dev, es8323->spk_ctl_gpio, GPIOF_DIR_OUT, NULL);
+		ret = devm_gpio_request_one(&i2c->dev, es8323->spk_ctl_gpio, GPIOF_DIR_OUT, "spk_ctl_gpio");
 		if (ret != 0) {
 			dev_err(&i2c->dev, "Failed to request spk_ctl_gpio\n");
 			return ret;
 		}
 		es8323_set_gpio(ES8323_CODEC_SET_SPK, !es8323->spk_gpio_level);
+	}
+
+	es8323->ear_ctl_gpio = of_get_named_gpio_flags(i2c->dev.of_node, "ear-con-gpio", 0, &flags);
+	if (es8323->ear_ctl_gpio < 0) {
+		dev_info(&i2c->dev, "Can not read property ear_ctl_gpio\n");
+		es8323->ear_ctl_gpio = INVALID_GPIO;
+	} else {
+		es8323->ear_gpio_level = (flags & OF_GPIO_ACTIVE_LOW) ? 0 : 1;
+		ret = devm_gpio_request_one(&i2c->dev, es8323->ear_ctl_gpio, GPIOF_DIR_OUT, "ear_ctl_gpio");
+		if (ret != 0) {
+			dev_err(&i2c->dev, "Failed to request ear_ctl_gpio\n");
+			return ret;
+		}
+		es8323_set_gpio(ES8323_CODEC_SET_EAR, !es8323->ear_gpio_level);
 	}
 
 	es8323->hp_det_gpio = of_get_named_gpio_flags(i2c->dev.of_node, "hp-det-gpio", 0, &flags);
@@ -961,9 +1109,18 @@ static int es8323_i2c_probe(struct i2c_client *i2c,
 			}
 		}
 	}
+
+	es8323_line_det_gpio = of_get_named_gpio(i2c->dev.of_node, "line-det-gpio", 0);
+	if (es8323_line_det_gpio < 0) {
+		printk("%s() Can not read property es8323_line_det_gpio\n", __FUNCTION__);
+		es8323_line_det_gpio = INVALID_GPIO;
+	}
+    printk("es8323_line_det_gpio:%d\n", es8323_line_det_gpio);
+
 	ret = snd_soc_register_codec(&i2c->dev,
 				     &soc_codec_dev_es8323,
 				     &es8323_dai, 1);
+
 	return ret;
 }
 
@@ -982,9 +1139,13 @@ MODULE_DEVICE_TABLE(i2c, es8323_i2c_id);
 
 void es8323_i2c_shutdown(struct i2c_client *client)
 {
+	/*
 	struct es8323_priv *es8323 = es8323_private;
 
 	es8323_set_gpio(ES8323_CODEC_SET_SPK, !es8323->spk_gpio_level);
+	*/
+	spk_detect_do_switch(0);
+
 	mdelay(20);
 	snd_soc_write(es8323_codec, ES8323_CONTROL2, 0x58);
 	snd_soc_write(es8323_codec, ES8323_CONTROL1, 0x32);

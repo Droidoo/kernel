@@ -41,6 +41,7 @@
  */
 
 #include "rk3288.dtsi"
+#include <dt-bindings/input/input.h>
 
 / {
 	memory {
@@ -143,22 +144,24 @@
 	};
 
 	leds {
-		compatible = "gpio-leds";
+       compatible = "gpio-leds";
 
-		work {
-			gpios = <&gpio8 1 GPIO_ACTIVE_LOW>;
-			label = "firefly:blue:user";
-			linux,default-trigger = "rc-feedback";
+		power_led: power {
+			label = "firefly:blue:power";
+			linux,default-trigger = "ir-power-click";
+			gpios = <&gpio8 1 GPIO_ACTIVE_HIGH>;
 			pinctrl-names = "default";
-			pinctrl-0 = <&work_led>;
+			pinctrl-0 = <&led_power>;
+			default-state = "on";
 		};
 
-		power {
-			gpios = <&gpio8 2 GPIO_ACTIVE_LOW>;
-			label = "firefly:green:power";
-			linux,default-trigger = "default-on";
+		user_led: user {
+			label = "firefly:yellow:user";
+			linux,default-trigger = "ir-user-click";
+			gpios = <&gpio8 2 GPIO_ACTIVE_HIGH>;
 			pinctrl-names = "default";
-			pinctrl-0 = <&power_led>;
+			pinctrl-0 = <&led_user>;
+			default-state = "off";
 		};
 	};
 
@@ -342,13 +345,8 @@
 	};
 };
 
-&edp_in {
-	/delete-node/ endpoint@0;
-};
-
 &edp_phy {
 	status = "disabled";
-	//status = "okay";
 };
 
 &emmc {
@@ -392,10 +390,6 @@
 &hevc_service {
 	status = "okay";
 
-};
-
-&hdmi_in {
-	/delete-node/ endpoint@1;
 };
 
 &i2c0 {
@@ -656,12 +650,12 @@
 	};
 
 	leds {
-		power_led: power-led {
-			rockchip,pins = <8 2 RK_FUNC_GPIO &pcfg_pull_none>;
+		led_power: led-power {
+			rockchip,pins = <8 1 RK_FUNC_GPIO &pcfg_pull_none>;
 		};
 
-		work_led: work-led {
-			rockchip,pins = <8 1 RK_FUNC_GPIO &pcfg_pull_none>;
+		led_user: led-work {
+			rockchip,pins = <8 2 RK_FUNC_GPIO &pcfg_pull_none>;
 		};
 	};
 
@@ -717,6 +711,31 @@
 			rockchip,pins = <4 19 RK_FUNC_GPIO &pcfg_pull_none>;
 		};
 	};
+};
+
+&pwm0 {
+	interrupts = <GIC_SPI 78 IRQ_TYPE_LEVEL_HIGH>;
+	compatible = "rockchip,remotectl-pwm";
+	remote_pwm_id = <0>;
+	handle_cpu_id = <1>;
+	status = "okay";
+
+	ir_key1 {
+        rockchip,usercode = <0xff00>;
+        rockchip,key_table =
+            <0xeb   KEY_POWER>,
+            <0xec   KEY_COMPOSE>,
+            <0xfe   KEY_BACK>,
+            <0xb7   KEY_HOME>,
+            <0xa3   KEY_WWW>,
+            <0xf4   KEY_VOLUMEUP>,
+            <0xa7   KEY_VOLUMEDOWN>,
+            <0xf8   KEY_ENTER>,
+            <0xfc   KEY_UP>,
+            <0xfd   KEY_DOWN>,
+            <0xf1   KEY_LEFT>,
+            <0xe5   KEY_RIGHT>;
+    };
 };
 
 &i2s {
@@ -821,10 +840,6 @@
 	status = "okay";
 };
 
-&vopb_out {
-	/delete-node/ endpoint@1;
-};
-
 &vopl {
 	status = "okay";
 };
@@ -835,10 +850,6 @@
 
 &vpu_service {
 	status = "okay";
-};
-
-&vopl_out {
-	/delete-node/ endpoint@0;
 };
 
 &wdt {
