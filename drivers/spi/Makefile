@@ -94,4 +94,8 @@ obj-$(CONFIG_SPI_XLP)			+= spi-xlp.o
 obj-$(CONFIG_SPI_XTENSA_XTFPGA)		+= spi-xtensa-xtfpga.o
 obj-$(CONFIG_SPI_ZYNQMP_GQSPI)		+= spi-zynqmp-gqspi.o
 obj-$(CONFIG_SPI_WK2XXX) += spi-wk2xxx.o
+ifdef CONFIG_ARM64
 spi-wk2xxx-objs = spi-wk2xxx
+else
+spi-wk2xxx-objs = spi-wk2xxx_arm
+endif
