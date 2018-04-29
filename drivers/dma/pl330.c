@@ -1641,8 +1641,6 @@ static void pl330_dotask(unsigned long data)
 
 	/* The DMAC itself gone nuts */
 	if (pl330->dmac_tbd.reset_dmac) {
-		printk("%s, %d\r\n", __func__, __LINE__);
-	    dump_stack();
 		pl330->state = DYING;
 		/* Reset the manager too */
 		pl330->dmac_tbd.reset_mngr = true;
@@ -1688,7 +1686,6 @@ static void pl330_dotask(unsigned long data)
 
 	if (pl330->state == DYING) {
 		pl330->state = INIT; 
-		printk("%s, %d\r\n", __func__, __LINE__);
 	    dump_stack();	
 	}
 	spin_unlock_irqrestore(&pl330->lock, flags);
@@ -1736,8 +1733,6 @@ static int pl330_update(struct pl330_dmac *pl330)
 	if (pl330->pcfg.num_events < 32
 			&& val & ~((1 << pl330->pcfg.num_events) - 1)) {
 		pl330->dmac_tbd.reset_dmac = true;
-		printk("%s, %d\r\n", __func__, __LINE__);
-		dump_stack();
 		dev_err_ratelimited(pl330->ddma.dev, "%s:%d Unexpected!\n",
 				    __func__, __LINE__);
 		ret = 1;
@@ -1794,10 +1789,6 @@ updt_exit:
 			|| pl330->dmac_tbd.reset_mngr
 			|| pl330->dmac_tbd.reset_chan) {
 		ret = 1;
-		if (pl330->dmac_tbd.reset_dmac) 
-			printk ("pl330->dmac_tbd.reset_dmac %d\r\n", pl330->dmac_tbd.reset_dmac);
-		printk("%s, %d\r\n", __func__, __LINE__);
-	    dump_stack();
 		tasklet_schedule(&pl330->tasks);
 	}
 
@@ -2065,9 +2056,6 @@ static int pl330_add(struct pl330_dmac *pl330)
 	tasklet_init(&pl330->tasks, pl330_dotask, (unsigned long) pl330);
 
 	pl330->state = INIT;
-	printk("%s, %d\r\n", __func__, __LINE__);
-	dump_stack();
-	
 
 	return 0;
 }
