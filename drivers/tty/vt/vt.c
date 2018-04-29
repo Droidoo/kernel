@@ -3932,10 +3932,6 @@ void unblank_screen(void)
  */
 static void blank_screen_t(unsigned long dummy)
 {
-	/*We dont want the screen to be black*/
-	if (dummy >= 0)
-		return ;
-
 	if (unlikely(!keventd_up())) {
 		mod_timer(&console_timer, jiffies + (blankinterval * HZ));
 		return;
